@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Settings, Cpu, Server, Sliders, ChevronRight, Play, Zap, GraduationCap } from 'lucide-react';
+import { Settings, Cpu, Server, Sliders, ChevronRight, Play, Zap, GraduationCap, Plus, Trash2 } from 'lucide-react';
 import type { ModelConfig, HardwareConfig, InferenceConfig, InferenceMode } from '../types/model';
+import { getCustomModels, deleteCustomModel } from '../utils/storage';
 
 const MODE_CONFIG = {
   training: {
@@ -33,6 +34,8 @@ interface ConfigPanelProps {
   onModelChange: (model: ModelConfig) => void;
   onHardwareChange: (hardware: HardwareConfig) => void;
   onInferenceConfigChange: (config: InferenceConfig) => void;
+  onOpenImportModal: () => void;
+  customModelsVersion: number; // 用于触发重新加载
 }
 
 export function ConfigPanel({
@@ -44,8 +47,22 @@ export function ConfigPanel({
   onModelChange,
   onHardwareChange,
   onInferenceConfigChange,
+  onOpenImportModal,
+  customModelsVersion,
 }: ConfigPanelProps) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>('Qwen3');
+  const [customModels, setCustomModels] = useState<ModelConfig[]>([]);
+
+  // 加载自定义模型
+  useEffect(() => {
+    setCustomModels(getCustomModels());
+  }, [customModelsVersion]);
+
+  const handleDeleteCustomModel = (name: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    deleteCustomModel(name);
+    setCustomModels(getCustomModels());
+  };
 
   return (
     <div className="space-y-4">
@@ -61,6 +78,7 @@ export function ConfigPanel({
         </div>
         
         <div className="p-2 max-h-80 overflow-y-auto">
+          {/* 预设模型 */}
           {Object.entries(modelCategories).map(([category, models]) => (
             <div key={category} className="mb-1">
               <button
@@ -104,6 +122,73 @@ export function ConfigPanel({
               )}
             </div>
           ))}
+
+          {/* 自定义模型 */}
+          {customModels.length > 0 && (
+            <div className="mb-1">
+              <button
+                onClick={() => setExpandedCategory(expandedCategory === 'custom' ? null : 'custom')}
+                className="w-full px-3 py-2 flex items-center justify-between text-sm hover:bg-gray-800/50 rounded-lg transition-colors"
+              >
+                <span className="text-amber-400">⭐ 自定义模型</span>
+                <motion.div
+                  animate={{ rotate: expandedCategory === 'custom' ? 90 : 0 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <ChevronRight className="w-4 h-4 text-gray-500" />
+                </motion.div>
+              </button>
+              
+              {expandedCategory === 'custom' && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="ml-2 space-y-0.5"
+                >
+                  {customModels.map((model) => (
+                    <div
+                      key={model.name}
+                      className={`flex items-center gap-2 px-3 py-2 text-sm rounded-lg transition-all ${
+                        selectedModel.name === model.name
+                          ? 'bg-amber-600/30 text-amber-300 border border-amber-500/50'
+                          : 'hover:bg-gray-800/50 text-gray-400'
+                      }`}
+                    >
+                      <button
+                        onClick={() => onModelChange(model)}
+                        className="flex-1 text-left"
+                      >
+                        <div className="font-medium">{model.name}</div>
+                        <div className="text-xs text-gray-500 mt-0.5">
+                          {model.numLayers}L / {model.hiddenSize}d / {model.attentionType.toUpperCase()}
+                          {model.ffnType === 'moe' && ` / ${model.numExperts}E`}
+                        </div>
+                      </button>
+                      <button
+                        onClick={(e) => handleDeleteCustomModel(model.name, e)}
+                        className="p-1 text-red-400 hover:bg-red-500/20 rounded transition-colors"
+                        title="删除"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </motion.div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 导入按钮 */}
+        <div className="p-2 border-t border-gray-700/50">
+          <button
+            onClick={onOpenImportModal}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 rounded-lg transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            导入/创建自定义模型
+          </button>
         </div>
       </motion.div>
 

@@ -1,7 +1,7 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronDown, Cpu, HardDrive } from 'lucide-react';
 import type { ModuleAnalysis } from '../types/model';
-import { formatNumber, formatBytes, formatTime } from '../utils/calculator';
+import { formatNumber, formatBytes } from '../utils/calculator';
 import { OperationList } from './OperationList';
 
 interface ModuleCardProps {

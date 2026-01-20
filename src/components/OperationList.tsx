@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Clock, Layers, ArrowRight } from 'lucide-react';
+import { Clock, ArrowRight } from 'lucide-react';
 import type { OperationAnalysis } from '../types/model';
 import { formatNumber, formatBytes, formatTime } from '../utils/calculator';
 

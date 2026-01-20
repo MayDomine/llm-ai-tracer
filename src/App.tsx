@@ -10,6 +10,7 @@ import { ModuleCard } from './components/ModuleCard';
 import { StatsPanel } from './components/StatsPanel';
 import { ConfigPanel } from './components/ConfigPanel';
 import { RooflineChart } from './components/RooflineChart';
+import { ModelImportModal } from './components/ModelImportModal';
 
 function App() {
   // 状态管理
@@ -24,6 +25,8 @@ function App() {
   });
   const [expandedModule, setExpandedModule] = useState<string | null>('attention');
   const [showRoofline, setShowRoofline] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [customModelsVersion, setCustomModelsVersion] = useState(0);
 
   // 计算分析结果
   const analysis: ModelAnalysis = useMemo(() => {
@@ -85,6 +88,8 @@ function App() {
               onModelChange={setSelectedModel}
               onHardwareChange={setSelectedHardware}
               onInferenceConfigChange={setInferenceConfig}
+              onOpenImportModal={() => setShowImportModal(true)}
+              customModelsVersion={customModelsVersion}
             />
           </div>
 
@@ -222,6 +227,13 @@ function App() {
           <p>LLM AI Tracer - 基于 Roofline 模型的大模型性能分析工具</p>
         </div>
       </footer>
+
+      {/* 模型导入模态框 */}
+      <ModelImportModal
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        onModelImported={() => setCustomModelsVersion(v => v + 1)}
+      />
     </div>
   );
 }
