@@ -1,0 +1,11 @@
+本项目是一个可视化大模型算数密度的前端项目
+根据给定模型配置，对模型模块中所有涉及到的运算进行flops估算，并在前端可视化展示，同时根据用户提供的硬件计算能力和内存带宽，对计算bound和memory bound的运算用不同颜色区分，比如计算bound为绿色，memory bound为红色。
+前端需要展示主要分为embedding、TransformerBlock、lm head三个模块
+然后TransformerBlock里分为FFN和Attention，再进一步拆分成不同shape的gemm以及其他softmax、layernorm等操作
+仅考虑所有layer的TransformerBlock都一样的情况
+然后还需要考虑新型的一些架构，比如gpt的ffn是两个linear，llama是三个为gated linear 架构，然后还有moe架构
+attention需要考虑MHA、GQA
+
+最后提供主流模型的预设配置，比如Qwen3整个系列(包括MoE)、LLama2/3以及MiniCPM
+目前暂时不考虑MLA，所以跳过MLA模型哈
+然后尽可能多的在前端让用户感知到整个模型计算过程中的性能瓶颈
