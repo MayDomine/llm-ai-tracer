@@ -47,7 +47,7 @@ function StatCard({ icon, label, value, subValue, color, delay = 0 }: StatCardPr
 }
 
 export function StatsPanel({ analysis }: StatsPanelProps) {
-  const { totalFlops, totalMemoryBytes, overallArithmeticIntensity, estimatedLatency, rooflinePoint, inferenceConfig } = analysis;
+  const { totalFlops, totalMemoryBytes, overallArithmeticIntensity, estimatedLatency, rooflinePoint, inferenceConfig, hardwareConfig } = analysis;
   
   const computeBoundTotal = 
     analysis.embedding.computeBoundOps + 
@@ -64,6 +64,11 @@ export function StatsPanel({ analysis }: StatsPanelProps) {
 
   const modeConfig = MODE_LABELS[inferenceConfig.mode];
   const ModeIcon = modeConfig.icon;
+  
+  // Calculate detailed latency breakdown
+  const computeTime = totalFlops / (hardwareConfig.computeCapability * 1e12) * 1000; // ms
+  const memoryTime = totalMemoryBytes / (hardwareConfig.memoryBandwidth * 1e12) * 1000; // ms
+  const isComputeBottleneck = computeTime > memoryTime;
 
   return (
     <div className="space-y-4">
@@ -217,6 +222,84 @@ export function StatsPanel({ analysis }: StatsPanelProps) {
                 </>
               )}
             </div>
+          </div>
+        </div>
+      </motion.div>
+
+      {/* 延迟分解 (Latency Breakdown) */}
+      <motion.div
+        className="glass rounded-xl p-4"
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.25 }}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Clock className="w-5 h-5 text-orange-400" />
+            <h3 className="font-semibold">延迟分解</h3>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-3 gap-4 mb-4">
+          <div className="p-3 rounded-lg bg-gray-800/50 text-center">
+            <div className="text-xs text-gray-500 mb-1">Compute Time</div>
+            <div className={`text-lg font-mono ${isComputeBottleneck ? 'text-red-400' : 'text-gray-400'}`}>
+              {formatTime(computeTime)}
+            </div>
+            {isComputeBottleneck && (
+              <div className="text-xs text-red-400 mt-1">← Bottleneck</div>
+            )}
+          </div>
+          <div className="p-3 rounded-lg bg-gray-800/50 text-center">
+            <div className="text-xs text-gray-500 mb-1">Memory Time</div>
+            <div className={`text-lg font-mono ${!isComputeBottleneck ? 'text-red-400' : 'text-gray-400'}`}>
+              {formatTime(memoryTime)}
+            </div>
+            {!isComputeBottleneck && (
+              <div className="text-xs text-red-400 mt-1">← Bottleneck</div>
+            )}
+          </div>
+          <div className="p-3 rounded-lg bg-gray-800/50 text-center">
+            <div className="text-xs text-gray-500 mb-1">Total Latency</div>
+            <div className="text-lg font-mono text-orange-400">
+              {formatTime(estimatedLatency)}
+            </div>
+            <div className="text-xs text-gray-500 mt-1">
+              = max(compute, memory)
+            </div>
+          </div>
+        </div>
+
+        {/* Per-module latency */}
+        <div className="pt-4 border-t border-gray-700/50">
+          <div className="text-xs text-gray-500 mb-2">Per-Module Latency</div>
+          <div className="space-y-1">
+            {[
+              { name: 'Embedding', time: analysis.embedding.operations.reduce((sum, op) => sum + op.theoreticalTime, 0), color: 'text-blue-400' },
+              { name: 'Transformer (×' + analysis.modelConfig.numLayers + ')', time: analysis.transformerBlock.operations.reduce((sum, op) => sum + op.theoreticalTime, 0) * analysis.modelConfig.numLayers, color: 'text-purple-400' },
+              { name: 'LM Head', time: analysis.lmHead.operations.reduce((sum, op) => sum + op.theoreticalTime, 0), color: 'text-orange-400' },
+            ].map((module) => {
+              const percentage = (module.time / estimatedLatency) * 100;
+              return (
+                <div key={module.name} className="flex items-center gap-2">
+                  <div className="w-36 text-xs text-gray-400 truncate">{module.name}</div>
+                  <div className="flex-1 h-2 bg-gray-800 rounded-full overflow-hidden">
+                    <motion.div
+                      className={`h-full bg-current ${module.color}`}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${percentage}%` }}
+                      transition={{ duration: 0.5 }}
+                    />
+                  </div>
+                  <div className={`w-20 text-right text-xs font-mono ${module.color}`}>
+                    {formatTime(module.time)}
+                  </div>
+                  <div className="w-12 text-right text-xs text-gray-500">
+                    {percentage.toFixed(1)}%
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       </motion.div>

@@ -36,6 +36,7 @@ interface ConfigPanelProps {
   onInferenceConfigChange: (config: InferenceConfig) => void;
   onOpenImportModal: () => void;
   customModelsVersion: number; // 用于触发重新加载
+  hideInferenceConfig?: boolean; // 隐藏推理配置 (用于训练模式)
 }
 
 export function ConfigPanel({
@@ -48,6 +49,7 @@ export function ConfigPanel({
   onHardwareChange,
   onInferenceConfigChange,
   onOpenImportModal,
+  hideInferenceConfig = false,
   customModelsVersion,
 }: ConfigPanelProps) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>('Qwen3');
@@ -269,173 +271,177 @@ export function ConfigPanel({
         </div>
       </motion.div>
 
-      {/* 推理模式 */}
-      <motion.div
-        className="glass rounded-xl overflow-hidden"
-        initial={{ opacity: 0, x: -20 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ delay: 0.2 }}
-      >
-        <div className="px-4 py-3 border-b border-gray-700/50 flex items-center gap-2">
-          <Sliders className="w-4 h-4 text-purple-400" />
-          <h3 className="font-medium text-sm">推理模式</h3>
-        </div>
-        
-        <div className="p-3">
-          {/* 模式选择 */}
-          <div className="grid grid-cols-3 gap-2 mb-4">
-            {(Object.entries(MODE_CONFIG) as [InferenceMode, typeof MODE_CONFIG.training][]).map(([mode, config]) => {
-              const Icon = config.icon;
-              const isActive = inferenceConfig.mode === mode;
-              return (
-                <button
-                  key={mode}
-                  onClick={() => onInferenceConfigChange({ ...inferenceConfig, mode })}
-                  className={`p-2 rounded-lg transition-all text-center ${
-                    isActive
-                      ? `bg-gradient-to-br ${config.color} text-white shadow-lg`
-                      : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
-                  }`}
-                >
-                  <Icon className="w-4 h-4 mx-auto mb-1" />
-                  <div className="text-xs font-medium">{config.label}</div>
-                </button>
-              );
-            })}
+      {/* 推理模式 - 仅在推理分析模式显示 */}
+      {!hideInferenceConfig && (
+        <motion.div
+          className="glass rounded-xl overflow-hidden"
+          initial={{ opacity: 0, x: -20 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ delay: 0.2 }}
+        >
+          <div className="px-4 py-3 border-b border-gray-700/50 flex items-center gap-2">
+            <Sliders className="w-4 h-4 text-purple-400" />
+            <h3 className="font-medium text-sm">推理模式</h3>
           </div>
           
-          {/* 模式说明 */}
-          <div className="text-xs text-gray-500 mb-4 p-2 rounded-lg bg-gray-800/30">
-            {inferenceConfig.mode === 'training' && (
-              <p>🎓 <strong>Training</strong>: 完整序列前向传播，用于训练或评估整个序列的计算量。</p>
-            )}
-            {inferenceConfig.mode === 'prefill' && (
-              <p>▶️ <strong>Prefill</strong>: 处理输入prompt，生成所有token的KV Cache。类似training但用于推理。</p>
-            )}
-            {inferenceConfig.mode === 'decode' && (
-              <p>⚡ <strong>Decode</strong>: 自回归生成阶段，每次生成1个token，需要读取KV Cache。</p>
-            )}
-          </div>
-        </div>
-      </motion.div>
-
-      {/* 输入参数 */}
-      <motion.div
-        className="glass rounded-xl overflow-hidden"
-        initial={{ opacity: 0, x: -20 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ delay: 0.25 }}
-      >
-        <div className="px-4 py-3 border-b border-gray-700/50 flex items-center gap-2">
-          <Settings className="w-4 h-4 text-amber-400" />
-          <h3 className="font-medium text-sm">输入参数</h3>
-          <span className="text-xs text-gray-500 ml-auto">
-            {MODE_CONFIG[inferenceConfig.mode].label} 模式
-          </span>
-        </div>
-        
-        <div className="p-4 space-y-4">
-          {/* Batch Size */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-sm text-gray-400">Batch Size</label>
-              <span className="font-mono text-sm text-purple-400">{inferenceConfig.batchSize}</span>
-            </div>
-            <input
-              type="range"
-              min="1"
-              max="128"
-              value={inferenceConfig.batchSize}
-              onChange={(e) => onInferenceConfigChange({
-                ...inferenceConfig,
-                batchSize: Number(e.target.value),
+          <div className="p-3">
+            {/* 模式选择 */}
+            <div className="grid grid-cols-3 gap-2 mb-4">
+              {(Object.entries(MODE_CONFIG) as [InferenceMode, typeof MODE_CONFIG.training][]).map(([mode, config]) => {
+                const Icon = config.icon;
+                const isActive = inferenceConfig.mode === mode;
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => onInferenceConfigChange({ ...inferenceConfig, mode })}
+                    className={`p-2 rounded-lg transition-all text-center ${
+                      isActive
+                        ? `bg-gradient-to-br ${config.color} text-white shadow-lg`
+                        : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4 mx-auto mb-1" />
+                    <div className="text-xs font-medium">{config.label}</div>
+                  </button>
+                );
               })}
-              className="w-full"
-            />
-            <div className="flex justify-between text-xs text-gray-600 mt-1">
-              <span>1</span>
-              <span>128</span>
+            </div>
+            
+            {/* 模式说明 */}
+            <div className="text-xs text-gray-500 mb-4 p-2 rounded-lg bg-gray-800/30">
+              {inferenceConfig.mode === 'training' && (
+                <p>🎓 <strong>Training</strong>: 完整序列前向传播，用于训练或评估整个序列的计算量。</p>
+              )}
+              {inferenceConfig.mode === 'prefill' && (
+                <p>▶️ <strong>Prefill</strong>: 处理输入prompt，生成所有token的KV Cache。类似training但用于推理。</p>
+              )}
+              {inferenceConfig.mode === 'decode' && (
+                <p>⚡ <strong>Decode</strong>: 自回归生成阶段，每次生成1个token，需要读取KV Cache。</p>
+              )}
             </div>
           </div>
+        </motion.div>
+      )}
 
-          {/* 根据模式显示不同的参数 */}
-          {inferenceConfig.mode !== 'decode' ? (
-            /* Training / Prefill: 序列长度 */
+      {/* 输入参数 - 仅在推理分析模式显示 */}
+      {!hideInferenceConfig && (
+        <motion.div
+          className="glass rounded-xl overflow-hidden"
+          initial={{ opacity: 0, x: -20 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ delay: 0.25 }}
+        >
+          <div className="px-4 py-3 border-b border-gray-700/50 flex items-center gap-2">
+            <Settings className="w-4 h-4 text-amber-400" />
+            <h3 className="font-medium text-sm">输入参数</h3>
+            <span className="text-xs text-gray-500 ml-auto">
+              {MODE_CONFIG[inferenceConfig.mode].label} 模式
+            </span>
+          </div>
+          
+          <div className="p-4 space-y-4">
+            {/* Batch Size */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <label className="text-sm text-gray-400">序列长度 (Seq Length)</label>
-                <span className="font-mono text-sm text-purple-400">{inferenceConfig.seqLen}</span>
-              </div>
-              <input
-                type="range"
-                min="128"
-                max="16384"
-                step="128"
-                value={inferenceConfig.seqLen}
-                onChange={(e) => onInferenceConfigChange({
-                  ...inferenceConfig,
-                  seqLen: Number(e.target.value),
-                })}
-                className="w-full"
-              />
-              <div className="flex justify-between text-xs text-gray-600 mt-1">
-                <span>128</span>
-                <span>16384</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-2">
-                处理的token数 = Batch × SeqLen = {inferenceConfig.batchSize * inferenceConfig.seqLen}
-              </p>
-            </div>
-          ) : (
-            /* Decode: KV Cache长度 */
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-sm text-gray-400">KV Cache 长度</label>
-                <span className="font-mono text-sm text-orange-400">{inferenceConfig.kvCacheLen}</span>
+                <label className="text-sm text-gray-400">Batch Size</label>
+                <span className="font-mono text-sm text-purple-400">{inferenceConfig.batchSize}</span>
               </div>
               <input
                 type="range"
                 min="1"
-                max="16384"
-                step="1"
-                value={inferenceConfig.kvCacheLen}
+                max="128"
+                value={inferenceConfig.batchSize}
                 onChange={(e) => onInferenceConfigChange({
                   ...inferenceConfig,
-                  kvCacheLen: Number(e.target.value),
+                  batchSize: Number(e.target.value),
                 })}
                 className="w-full"
               />
               <div className="flex justify-between text-xs text-gray-600 mt-1">
                 <span>1</span>
-                <span>16384</span>
+                <span>128</span>
               </div>
-              <p className="text-xs text-gray-500 mt-2">
-                每次生成 <span className="text-orange-400 font-mono">1</span> 个新token，需要访问 <span className="text-orange-400 font-mono">{inferenceConfig.kvCacheLen}</span> 个历史KV
-              </p>
             </div>
-          )}
 
-          {/* Data Type */}
-          <div>
-            <label className="text-sm text-gray-400 block mb-2">数据类型</label>
-            <div className="grid grid-cols-5 gap-1">
-              {(['fp32', 'fp16', 'bf16', 'int8', 'int4'] as const).map((dtype) => (
-                <button
-                  key={dtype}
-                  onClick={() => onInferenceConfigChange({ ...inferenceConfig, dtype })}
-                  className={`px-2 py-1.5 text-xs rounded-lg transition-all ${
-                    inferenceConfig.dtype === dtype
-                      ? 'bg-purple-600/50 text-purple-300 border border-purple-500/50'
-                      : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
-                  }`}
-                >
-                  {dtype.toUpperCase()}
-                </button>
-              ))}
+            {/* 根据模式显示不同的参数 */}
+            {inferenceConfig.mode !== 'decode' ? (
+              /* Training / Prefill: 序列长度 */
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm text-gray-400">序列长度 (Seq Length)</label>
+                  <span className="font-mono text-sm text-purple-400">{inferenceConfig.seqLen}</span>
+                </div>
+                <input
+                  type="range"
+                  min="128"
+                  max="16384"
+                  step="128"
+                  value={inferenceConfig.seqLen}
+                  onChange={(e) => onInferenceConfigChange({
+                    ...inferenceConfig,
+                    seqLen: Number(e.target.value),
+                  })}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-xs text-gray-600 mt-1">
+                  <span>128</span>
+                  <span>16384</span>
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  处理的token数 = Batch × SeqLen = {inferenceConfig.batchSize * inferenceConfig.seqLen}
+                </p>
+              </div>
+            ) : (
+              /* Decode: KV Cache长度 */
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm text-gray-400">KV Cache 长度</label>
+                  <span className="font-mono text-sm text-orange-400">{inferenceConfig.kvCacheLen}</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="16384"
+                  step="1"
+                  value={inferenceConfig.kvCacheLen}
+                  onChange={(e) => onInferenceConfigChange({
+                    ...inferenceConfig,
+                    kvCacheLen: Number(e.target.value),
+                  })}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-xs text-gray-600 mt-1">
+                  <span>1</span>
+                  <span>16384</span>
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  每次生成 <span className="text-orange-400 font-mono">1</span> 个新token，需要访问 <span className="text-orange-400 font-mono">{inferenceConfig.kvCacheLen}</span> 个历史KV
+                </p>
+              </div>
+            )}
+
+            {/* Data Type */}
+            <div>
+              <label className="text-sm text-gray-400 block mb-2">数据类型</label>
+              <div className="grid grid-cols-5 gap-1">
+                {(['fp32', 'fp16', 'bf16', 'int8', 'int4'] as const).map((dtype) => (
+                  <button
+                    key={dtype}
+                    onClick={() => onInferenceConfigChange({ ...inferenceConfig, dtype })}
+                    className={`px-2 py-1.5 text-xs rounded-lg transition-all ${
+                      inferenceConfig.dtype === dtype
+                        ? 'bg-purple-600/50 text-purple-300 border border-purple-500/50'
+                        : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
+                    }`}
+                  >
+                    {dtype.toUpperCase()}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
-      </motion.div>
+        </motion.div>
+      )}
 
       {/* 当前模型信息 */}
       <motion.div

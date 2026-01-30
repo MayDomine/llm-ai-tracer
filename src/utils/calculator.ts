@@ -1,6 +1,11 @@
 /**
  * LLM FLOPs 和内存访问计算器
  * 基于 Roofline 模型分析算术密度
+ * 
+ * 公式参考:
+ * - OpenAI Scaling Laws: Forward FLOPs ≈ 2N, Training FLOPs ≈ 6N
+ * - GEMM FLOPs: 2 * M * N * K (multiply-accumulate)
+ * - Memory Access: (M*K + K*N + M*N) * bytes_per_element
  */
 
 import type { 
@@ -13,13 +18,98 @@ import type {
 } from '../types/model';
 
 // 数据类型字节数映射
-const DTYPE_BYTES: Record<InferenceConfig['dtype'], number> = {
+export const DTYPE_BYTES: Record<InferenceConfig['dtype'], number> = {
   'fp32': 4,
   'fp16': 2,
   'bf16': 2,
   'int8': 1,
   'int4': 0.5,
 };
+
+/**
+ * 计算模型参数数量
+ */
+export function calculateModelParameters(modelConfig: ModelConfig): {
+  embedding: number;
+  attention: number;
+  ffn: number;
+  lmHead: number;
+  layerNorm: number;
+  total: number;
+} {
+  const { 
+    hiddenSize: d, 
+    numLayers: L, 
+    vocabSize: V, 
+    numKVHeads: h_kv,
+    headDim: d_h,
+    intermediateSize: d_ff,
+    ffnType,
+    numExperts,
+    sharedExpertNum
+  } = modelConfig;
+
+  // Embedding: vocab_size × hidden_size
+  const embedding = V * d;
+
+  // Attention per layer: Q, K, V, O projections
+  // Q: d × d, K: d × (h_kv × d_h), V: d × (h_kv × d_h), O: d × d
+  const d_kv = h_kv * d_h;
+  const attentionPerLayer = d * d + d * d_kv + d * d_kv + d * d; // Q + K + V + O
+  const attention = attentionPerLayer * L;
+
+  // FFN per layer
+  let ffnPerLayer: number;
+  if (ffnType === 'gpt') {
+    // GPT-style: up (d × d_ff) + down (d_ff × d)
+    ffnPerLayer = 2 * d * d_ff;
+  } else if (ffnType === 'gated') {
+    // LLaMA-style: gate (d × d_ff) + up (d × d_ff) + down (d_ff × d)
+    ffnPerLayer = 3 * d * d_ff;
+  } else if (ffnType === 'moe') {
+    // MoE: router + experts
+    const nExperts = numExperts || 8;
+    const sharedExperts = sharedExpertNum || 0;
+    // Router: d × num_experts
+    const router = d * nExperts;
+    // Each expert: 3 × d × d_ff (gated)
+    const expertsParams = nExperts * 3 * d * d_ff;
+    // Shared experts
+    const sharedParams = sharedExperts * 3 * d * d_ff;
+    ffnPerLayer = router + expertsParams + sharedParams;
+  } else {
+    ffnPerLayer = 2 * d * d_ff;
+  }
+  const ffn = ffnPerLayer * L;
+
+  // LM Head: hidden_size × vocab_size (often tied with embedding)
+  const lmHead = d * V;
+
+  // LayerNorm/RMSNorm: 2 per layer (pre-attn, pre-ffn) + 1 final
+  // Each has hidden_size parameters (scale) + optional bias
+  const layerNormPerLayer = 2 * d;
+  const layerNorm = layerNormPerLayer * L + d; // +1 for final norm
+
+  const total = embedding + attention + ffn + lmHead + layerNorm;
+
+  return {
+    embedding,
+    attention,
+    ffn,
+    lmHead,
+    layerNorm,
+    total
+  };
+}
+
+/**
+ * 计算训练时的反向传播FLOPs倍数
+ */
+export function getBackwardMultiplier(useActivationCheckpointing: boolean): number {
+  // Backward pass requires ~2x forward FLOPs
+  // With activation checkpointing, we recompute forward once more
+  return useActivationCheckpointing ? 3 : 2; // Total: 4x or 3x forward for full training
+}
 
 // 生成唯一ID
 let idCounter = 0;
@@ -291,9 +381,10 @@ function analyzeAttention(
   
   // Softmax: 对每行进行softmax
   // Training/Prefill: S x S, Decode: 1 x kvSeqLen
+  // Softmax FLOPs per element: max(1) + exp(2) + sum(1) + div(1) = 5 ops
   const softmaxElements = B * H * querySeqLen * kvSeqLen;
   const softmaxFlops = 5 * softmaxElements;
-  const softmaxMemory = 2 * softmaxElements * bytesPerElement;
+  const softmaxMemory = 2 * softmaxElements * bytesPerElement; // Read attention scores + Write normalized
   operations.push(analyzeOperation(
     `${modePrefix}Softmax`,
     'softmax',
@@ -732,12 +823,15 @@ export function analyzeModel(
   // 重置ID计数器
   idCounter = 0;
   
+  // 计算模型参数量
+  const parameterCount = calculateModelParameters(modelConfig);
+  
   const embedding = analyzeEmbedding(modelConfig, inferenceConfig, hardwareConfig);
   const transformerBlock = analyzeTransformerBlock(modelConfig, inferenceConfig, hardwareConfig);
   const lmHead = analyzeLMHead(modelConfig, inferenceConfig, hardwareConfig);
   
-  // 计算总量 (考虑多层)
-  const totalFlops = 
+  // 计算总量 (考虑多层) - Forward Pass
+  const forwardFlops = 
     embedding.totalFlops + 
     transformerBlock.totalFlops * modelConfig.numLayers + 
     lmHead.totalFlops;
@@ -746,6 +840,20 @@ export function analyzeModel(
     embedding.totalMemoryBytes + 
     transformerBlock.totalMemoryBytes * modelConfig.numLayers + 
     lmHead.totalMemoryBytes;
+  
+  // 根据模式计算总FLOPs
+  let totalFlops: number;
+  let backwardFlops: number | undefined;
+  
+  if (inferenceConfig.mode === 'training') {
+    // Training mode: forward + backward (backward ≈ 2x forward)
+    backwardFlops = forwardFlops * 2;
+    totalFlops = forwardFlops + backwardFlops;
+  } else {
+    // Inference mode: forward only
+    totalFlops = forwardFlops;
+    backwardFlops = undefined;
+  }
   
   const overallArithmeticIntensity = totalFlops / totalMemoryBytes;
   
@@ -757,6 +865,18 @@ export function analyzeModel(
   const memoryTime = totalMemoryBytes / (hardwareConfig.memoryBandwidth * 1e12) * 1000;
   const estimatedLatency = Math.max(computeTime, memoryTime);
   
+  // 计算tokens数量
+  const numTokens = inferenceConfig.mode === 'decode' 
+    ? inferenceConfig.batchSize 
+    : inferenceConfig.batchSize * inferenceConfig.seqLen;
+  
+  // 计算每token的FLOPs
+  const flopsPerToken = totalFlops / numTokens;
+  
+  // 使用 2N 近似验证
+  const approximateFlops = 2 * parameterCount.total * numTokens;
+  const approximationError = Math.abs(totalFlops - approximateFlops) / approximateFlops;
+  
   return {
     modelConfig,
     hardwareConfig,
@@ -765,10 +885,17 @@ export function analyzeModel(
     transformerBlock,
     lmHead,
     totalFlops,
+    forwardFlops,
+    backwardFlops,
     totalMemoryBytes,
     overallArithmeticIntensity,
     estimatedLatency,
     rooflinePoint,
+    parameterCount,
+    flopsPerToken,
+    numTokens,
+    approximateFlops,
+    approximationError,
   };
 }
 
