@@ -65,6 +65,8 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
   const [tensorParallel, setTensorParallel] = useState(1);
   const [pipelineParallel, setPipelineParallel] = useState(1);
   const [expertParallel] = useState(1);
+  const [contextParallel, setContextParallel] = useState(1);
+  const [contextParallelType, setContextParallelType] = useState<'ulysses' | 'ring' | 'hybrid'>('ulysses');
   const [sequenceParallel, setSequenceParallel] = useState(false);
   const [zeroStage, setZeroStage] = useState<ZeROStage>(0);
   
@@ -78,8 +80,8 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
 
   // Calculate derived values
   const dataParallel = useMemo(() => {
-    return Math.floor(numGPUs / (tensorParallel * pipelineParallel * expertParallel));
-  }, [numGPUs, tensorParallel, pipelineParallel, expertParallel]);
+    return Math.floor(numGPUs / (tensorParallel * pipelineParallel * expertParallel * contextParallel));
+  }, [numGPUs, tensorParallel, pipelineParallel, expertParallel, contextParallel]);
 
   const gradientAccumulation = useMemo(() => {
     return Math.max(1, Math.ceil(globalBatchSize / (dataParallel * microBatchSize)));
@@ -97,9 +99,11 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
       tensorParallel,
       pipelineParallel,
       expertParallel,
+      contextParallel,
+      contextParallelType,
       sequenceParallel,
       zeroStage,
-      totalGPUs: dataParallel * tensorParallel * pipelineParallel * expertParallel,
+      totalGPUs: dataParallel * tensorParallel * pipelineParallel * expertParallel * contextParallel,
     },
     memoryOptimization: {
       recomputation,
@@ -112,7 +116,7 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
     gradientPrecision: 'fp32',
   }), [
     globalBatchSize, microBatchSize, gradientAccumulation,
-    dataParallel, tensorParallel, pipelineParallel, expertParallel,
+    dataParallel, tensorParallel, pipelineParallel, expertParallel, contextParallel, contextParallelType,
     sequenceParallel, zeroStage, recomputation, maxSeqLength, precision, flashAttention
   ]);
 
@@ -188,6 +192,7 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
             <div className="text-xs text-gray-500">Config</div>
             <div className="font-medium font-mono">
               DP{dataParallel}×TP{tensorParallel}×PP{pipelineParallel}
+              {contextParallel > 1 && `×CP${contextParallel}`}
               {expertParallel > 1 && `×EP${expertParallel}`}
             </div>
           </div>
@@ -346,6 +351,53 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                 </button>
               </div>
 
+              {/* Context Parallel (CP) */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-gray-400">CP (Context Parallel)</label>
+                  <span className="font-mono text-[10px] text-orange-400">{contextParallel}</span>
+                </div>
+                <div className="grid grid-cols-4 gap-0.5 mb-1">
+                  {[1, 2, 4, 8].map((cp) => (
+                    <button
+                      key={cp}
+                      onClick={() => setContextParallel(cp)}
+                      className={`px-1 py-1 text-[10px] rounded transition-all ${
+                        contextParallel === cp
+                          ? 'bg-orange-600/50 text-orange-300'
+                          : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
+                      }`}
+                    >
+                      {cp}
+                    </button>
+                  ))}
+                </div>
+                {contextParallel > 1 && (
+                  <>
+                    <div className="grid grid-cols-3 gap-0.5 mb-1">
+                      {(['ulysses', 'ring', 'hybrid'] as const).map((type) => (
+                        <button
+                          key={type}
+                          onClick={() => setContextParallelType(type)}
+                          className={`px-1 py-0.5 text-[10px] rounded transition-all capitalize ${
+                            contextParallelType === type
+                              ? 'bg-orange-600/40 text-orange-300'
+                              : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
+                          }`}
+                        >
+                          {type}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="text-[10px] text-gray-500">
+                      {contextParallelType === 'ulysses' && `All-to-all (limited by KV heads: ${modelConfig.numKVHeads / tensorParallel})`}
+                      {contextParallelType === 'ring' && 'Ring P2P (no head limit, higher comm)'}
+                      {contextParallelType === 'hybrid' && 'Ulysses + Ring combined'}
+                    </div>
+                  </>
+                )}
+              </div>
+
               {/* ZeRO Stage */}
               <div>
                 <label className="text-xs text-gray-400 block mb-1">ZeRO</label>
@@ -468,8 +520,6 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
             <MemoryModuleSection
               memoryBreakdown={analysis.memoryBreakdown}
               memoryEfficiency={analysis.memoryEfficiency}
-              numLayers={modelConfig.numLayers}
-              pipelineParallel={pipelineParallel}
               precision={precision}
               gpuMemoryGB={cluster.gpuMemoryGB}
             />
@@ -554,6 +604,12 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                     <span className="text-gray-500">PP</span>
                     <span className="font-mono text-gray-400">{analysis.communicationBreakdown.pipelineParallelTime.toFixed(1)} ms</span>
                   </div>
+                  {contextParallel > 1 && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">CP</span>
+                      <span className="font-mono text-orange-400">{analysis.communicationBreakdown.contextParallelTime.toFixed(1)} ms</span>
+                    </div>
+                  )}
                   <div className="flex justify-between pt-0.5 border-t border-gray-700">
                     <span className="text-gray-400">Total</span>
                     <span className="font-mono text-green-400">{analysis.communicationBreakdown.totalTime.toFixed(1)} ms</span>
@@ -644,20 +700,19 @@ function ConfigSection({
 function MemoryModuleSection({
   memoryBreakdown,
   memoryEfficiency,
-  numLayers,
-  pipelineParallel,
   precision,
   gpuMemoryGB,
 }: {
   memoryBreakdown: TrainingMemoryBreakdown;
   memoryEfficiency: number;
-  numLayers: number;
-  pipelineParallel: number;
   precision: 'fp32' | 'fp16' | 'bf16';
   gpuMemoryGB: number;
 }) {
   const [expandedModule, setExpandedModule] = useState<string | null>('activations');
-  const layersPerGPU = numLayers / pipelineParallel;
+  
+  // Use layersStored from calculator (accounts for recomputation)
+  const layersStored = memoryBreakdown.layersStored;
+  const layersPerGPU = memoryBreakdown.layersPerGPU;
   
   // Group activation tensors by module
   const activationTensors = memoryBreakdown.components.activations.tensors || [];
@@ -672,7 +727,7 @@ function MemoryModuleSection({
     !attentionTensors.includes(t) && !ffnTensors.includes(t)
   );
 
-  // Calculate per-layer memory for attention and FFN
+  // Calculate per-layer memory for attention and FFN (use layersStored, not layersPerGPU!)
   const attentionMemoryPerLayer = attentionTensors.reduce((sum, t) => sum + t.bytesPerGPU, 0);
   const ffnMemoryPerLayer = ffnTensors.reduce((sum, t) => sum + t.bytesPerGPU, 0);
   const otherMemoryPerLayer = otherTensors.reduce((sum, t) => sum + t.bytesPerGPU, 0);
@@ -689,7 +744,7 @@ function MemoryModuleSection({
             <div>
               <h2 className="text-xl font-semibold">Memory Breakdown per GPU</h2>
               <p className="text-sm text-gray-400">
-                {layersPerGPU} layers per GPU stage · {precision.toUpperCase()} training
+                {layersPerGPU} layers per GPU · {layersStored < layersPerGPU ? `${layersStored} stored (recompute)` : 'all stored'} · {precision.toUpperCase()}
               </p>
             </div>
           </div>
@@ -768,8 +823,8 @@ function MemoryModuleSection({
           name="Attention Activations"
           icon={<Cpu className="w-5 h-5" />}
           color="from-indigo-500 to-purple-500"
-          totalBytes={attentionMemoryPerLayer * layersPerGPU}
-          description={`${attentionTensors.length} tensors × ${layersPerGPU} layers`}
+          totalBytes={attentionMemoryPerLayer * layersStored}
+          description={`${attentionTensors.length} tensors × ${layersStored} stored layers${layersStored < layersPerGPU ? ` (of ${layersPerGPU})` : ''}`}
           isExpanded={expandedModule === 'attention'}
           onToggle={() => setExpandedModule(expandedModule === 'attention' ? null : 'attention')}
         >
@@ -789,7 +844,7 @@ function MemoryModuleSection({
                 </div>
                 <div className="text-right">
                   <div className="font-mono text-sm">{formatBytes(tensor.bytesPerGPU)}</div>
-                  <div className="text-xs text-gray-500">×{layersPerGPU} = {formatBytes(tensor.bytesPerGPU * layersPerGPU)}</div>
+                  <div className="text-xs text-gray-500">×{layersStored} = {formatBytes(tensor.bytesPerGPU * layersStored)}</div>
                 </div>
               </div>
             ))}
@@ -801,8 +856,8 @@ function MemoryModuleSection({
           name="FFN Activations"
           icon={<Cpu className="w-5 h-5" />}
           color="from-purple-500 to-pink-500"
-          totalBytes={ffnMemoryPerLayer * layersPerGPU}
-          description={`${ffnTensors.length} tensors × ${layersPerGPU} layers`}
+          totalBytes={ffnMemoryPerLayer * layersStored}
+          description={`${ffnTensors.length} tensors × ${layersStored} stored layers${layersStored < layersPerGPU ? ` (of ${layersPerGPU})` : ''}`}
           isExpanded={expandedModule === 'ffn'}
           onToggle={() => setExpandedModule(expandedModule === 'ffn' ? null : 'ffn')}
         >
@@ -822,7 +877,7 @@ function MemoryModuleSection({
                 </div>
                 <div className="text-right">
                   <div className="font-mono text-sm">{formatBytes(tensor.bytesPerGPU)}</div>
-                  <div className="text-xs text-gray-500">×{layersPerGPU} = {formatBytes(tensor.bytesPerGPU * layersPerGPU)}</div>
+                  <div className="text-xs text-gray-500">×{layersStored} = {formatBytes(tensor.bytesPerGPU * layersStored)}</div>
                 </div>
               </div>
             ))}
@@ -835,8 +890,8 @@ function MemoryModuleSection({
             name="Other Activations"
             icon={<Layers className="w-5 h-5" />}
             color="from-gray-500 to-gray-600"
-            totalBytes={otherMemoryPerLayer * layersPerGPU}
-            description={`${otherTensors.length} tensors × ${layersPerGPU} layers`}
+            totalBytes={otherMemoryPerLayer * layersStored}
+            description={`${otherTensors.length} tensors × ${layersStored} stored layers${layersStored < layersPerGPU ? ` (of ${layersPerGPU})` : ''}`}
             isExpanded={expandedModule === 'other'}
             onToggle={() => setExpandedModule(expandedModule === 'other' ? null : 'other')}
           >

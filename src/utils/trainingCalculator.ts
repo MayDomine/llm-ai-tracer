@@ -80,10 +80,10 @@ export function validateParallelism(
   cluster: ClusterTopology
 ): string[] {
   const errors: string[] = [];
-  const { dataParallel, tensorParallel, pipelineParallel, expertParallel } = parallelism;
+  const { dataParallel, tensorParallel, pipelineParallel, expertParallel, contextParallel, contextParallelType } = parallelism;
   
-  // Check total GPUs
-  const requiredGPUs = dataParallel * tensorParallel * pipelineParallel * expertParallel;
+  // Check total GPUs (now includes CP)
+  const requiredGPUs = dataParallel * tensorParallel * pipelineParallel * expertParallel * contextParallel;
   if (requiredGPUs > cluster.totalGPUs) {
     errors.push(`Configuration requires ${requiredGPUs} GPUs but only ${cluster.totalGPUs} available`);
   }
@@ -107,6 +107,37 @@ export function validateParallelism(
   if (model.ffnType === 'moe' && model.numExperts) {
     if (model.numExperts % expertParallel !== 0) {
       errors.push(`EP=${expertParallel} must divide num_experts=${model.numExperts}`);
+    }
+  }
+  
+  // ============ Context Parallel Validation ============
+  if (contextParallel > 1) {
+    // Effective KV heads after TP (KV heads is the limiting factor for Ulysses in GQA)
+    const effectiveKVHeads = model.numKVHeads / tensorParallel;
+    
+    if (contextParallelType === 'ulysses') {
+      // Ulysses: CP must divide the number of KV heads (more restrictive in GQA)
+      // After TP, each GPU has effectiveKVHeads, Ulysses further divides by CP
+      if (effectiveKVHeads % contextParallel !== 0) {
+        errors.push(`Ulysses CP=${contextParallel} must divide KV heads after TP (${effectiveKVHeads}). Consider using Ring or Hybrid.`);
+      }
+      if (contextParallel > effectiveKVHeads) {
+        errors.push(`Ulysses CP=${contextParallel} exceeds available KV heads (${effectiveKVHeads}). Use Ring attention instead.`);
+      }
+    } else if (contextParallelType === 'hybrid') {
+      // Hybrid: Ulysses up to KV heads limit, then Ring for the rest
+      // Calculate Ulysses degree (must divide KV heads)
+      const maxUlysses = effectiveKVHeads;
+      if (contextParallel > maxUlysses) {
+        // This is okay for hybrid - will use Ring for the extra parallelism
+        // Just a warning that Ring will be used
+      }
+    }
+    // Ring attention has no head limitation
+    
+    // CP should be within NVLink domain for best performance
+    if (contextParallel > cluster.gpusPerNode && contextParallelType === 'ulysses') {
+      errors.push(`Ulysses CP=${contextParallel} crosses node boundary. All-to-all is latency-sensitive.`);
     }
   }
   
@@ -158,10 +189,12 @@ export function calculateDetailedActivationMemory(
   tensorParallel: number,
   sequenceParallel: boolean,
   recomputation: RecomputationStrategy,
-  flashAttention: boolean
+  flashAttention: boolean,
+  contextParallel: number = 1  // CP splits sequence across GPUs
 ): LayerActivationBreakdown {
   const B = microBatchSize;
-  const S = seqLength;
+  // With Context Parallel, each GPU only handles S/CP tokens
+  const S = Math.ceil(seqLength / contextParallel);
   const d = model.hiddenSize;
   const H = model.numAttentionHeads;
   const H_kv = model.numKVHeads;
@@ -363,7 +396,41 @@ export function calculateDetailedActivationMemory(
     tensors,
     totalBytes,
     totalBytesPerGPU,
-    formula: `Sum of stored activation tensors per layer`,
+    formula: `Sum of stored activation tensors per layer (S=${S} tokens per GPU with CP=${contextParallel})`,
+  };
+}
+
+/**
+ * Calculate LM Head logits memory - this is a MAJOR memory consumer
+ * Shape: [B, S, vocab_size] - cannot be recomputed efficiently
+ * Must be stored for cross-entropy loss backward pass
+ */
+export function calculateLMHeadLogitsMemory(
+  model: ModelConfig,
+  microBatchSize: number,
+  seqLength: number,
+  precision: 'fp32' | 'fp16' | 'bf16',
+  tensorParallel: number,
+  contextParallel: number = 1
+): { bytes: number; bytesPerGPU: number; formula: string; shape: string } {
+  const B = microBatchSize;
+  // With CP, each GPU handles S/CP tokens
+  const S = Math.ceil(seqLength / contextParallel);
+  const V = model.vocabSize;
+  const elemBytes = getPrecisionBytes(precision);
+  
+  // Logits shape: [B, S, vocab_size]
+  // This is stored for the backward pass through cross-entropy loss
+  const bytes = B * S * V * elemBytes;
+  
+  // With TP, vocab is sharded across GPUs
+  const bytesPerGPU = tensorParallel > 1 ? bytes / tensorParallel : bytes;
+  
+  return {
+    bytes,
+    bytesPerGPU,
+    formula: `LM Head Logits: ${B} × ${S} × ${V} × ${elemBytes} bytes = ${(bytes / 1e9).toFixed(2)} GB (vocab=${V}, cannot recompute)`,
+    shape: `[${B}, ${S}, ${V}]`,
   };
 }
 
@@ -449,6 +516,9 @@ export function calculateTrainingMemory(
   
   // ============ Activation Memory (Detailed) ============
   const flashAttention = memoryOptimization.flashAttention ?? true; // Default to FlashAttention
+  const { contextParallel } = parallelism;
+  
+  // Per-layer activation memory (accounts for CP sequence split)
   const activationBreakdown = calculateDetailedActivationMemory(
     model,
     batch.microBatchSize,
@@ -457,27 +527,48 @@ export function calculateTrainingMemory(
     tensorParallel,
     sequenceParallel,
     memoryOptimization.recomputation,
-    flashAttention
+    flashAttention,
+    contextParallel  // Pass CP to reduce S by factor of CP
   );
   
   const activationsPerLayer = activationBreakdown.totalBytesPerGPU;
   
+  // ============ LM Head Logits Memory (MAJOR consumer!) ============
+  // Shape: [B, S/CP, vocab_size] - stored for cross-entropy loss backward
+  // This CANNOT be saved by recomputation - always needed for loss gradient
+  const lmHeadLogits = calculateLMHeadLogitsMemory(
+    model,
+    batch.microBatchSize,
+    config.maxSeqLength,
+    config.mixedPrecision,
+    tensorParallel,
+    contextParallel
+  );
+  
   // Total activations depends on recomputation strategy
-  // With full recomputation, only store 1 layer at a time
+  // - None/Selective: Store all layer activations (intermediate tensors)
+  // - Block: Store layer INPUTS for all layers, recompute attention/FFN within each block during backward
+  // - Full: Store only model input, recompute everything
   // With PP, we need to store activations for microbatches in flight
+  const layersPerGPU = model.numLayers / pipelineParallel;
   let layersStored: number;
   if (memoryOptimization.recomputation === 'full') {
+    // Full recomputation: only store model input, recompute all layers
     layersStored = 1;
   } else if (memoryOptimization.recomputation === 'block') {
-    layersStored = memoryOptimization.recomputationBlocks || Math.ceil(Math.sqrt(model.numLayers / pipelineParallel));
+    // Block recomputation: store layer INPUT for each Transformer block
+    // Attention/FFN are recomputed during backward, but we need to store 
+    // the input to each block so we can recompute it
+    layersStored = layersPerGPU; // All layers, but only storing layer inputs (not intermediate tensors)
   } else {
-    // Without recomputation, store all layers on this PP stage
-    layersStored = model.numLayers / pipelineParallel;
+    // Without recomputation (none/selective), store all layers with their intermediate tensors
+    layersStored = layersPerGPU;
   }
   
-  const activationsTotal = activationsPerLayer * layersStored;
+  // Total activation memory = per-layer × layers + LM Head logits
+  const activationsTotal = activationsPerLayer * layersStored + lmHeadLogits.bytesPerGPU;
   const numInFlight = pipelineParallel;
-  const peakActivations = activationsPerLayer * Math.min(layersStored, numInFlight);
+  const peakActivations = activationsPerLayer * Math.min(layersStored, numInFlight) + lmHeadLogits.bytesPerGPU;
   
   // ============ Communication Buffers ============
   // Double buffering for overlap
@@ -558,20 +649,35 @@ export function calculateTrainingMemory(
       bytes: activationsTotal,
       bytesPerGPU: activationsTotal,
       precision: config.mixedPrecision as 'fp32' | 'fp16' | 'bf16',
-      description: `Layer activations (${layersStored} layers stored, FlashAttention: ${flashAttention ? 'Yes' : 'No'})`,
-      formula: `${formatBytes(activationsPerLayer)}/layer × ${layersStored} layers = ${formatBytes(activationsTotal)}`,
+      description: `Layer activations (${layersStored} layers, CP=${contextParallel}) + LM Head logits`,
+      formula: `${formatBytes(activationsPerLayer)}/layer × ${layersStored} layers + LM Head ${formatBytes(lmHeadLogits.bytesPerGPU)} = ${formatBytes(activationsTotal)}`,
       isRequired: true,
-      tensors: activationBreakdown.tensors.filter(t => t.stored).map(t => ({
-        name: t.name,
-        shape: t.shape,
-        shapeValues: t.shapeValues,
-        elementCount: t.shapeValues.reduce((a, b) => a * b, 1),
-        bytes: t.bytes,
-        bytesPerGPU: t.bytesPerGPU,
-        precision: config.mixedPrecision as 'fp32' | 'fp16' | 'bf16',
-        formula: t.formula,
-        description: t.name,
-      })),
+      tensors: [
+        // Per-layer activation tensors
+        ...activationBreakdown.tensors.filter(t => t.stored).map(t => ({
+          name: t.name,
+          shape: t.shape,
+          shapeValues: t.shapeValues,
+          elementCount: t.shapeValues.reduce((a, b) => a * b, 1),
+          bytes: t.bytes,
+          bytesPerGPU: t.bytesPerGPU,
+          precision: config.mixedPrecision as 'fp32' | 'fp16' | 'bf16',
+          formula: t.formula,
+          description: t.name,
+        })),
+        // LM Head logits - major memory consumer, cannot be recomputed
+        {
+          name: 'LM Head Logits',
+          shape: lmHeadLogits.shape,
+          shapeValues: [batch.microBatchSize, Math.ceil(config.maxSeqLength / contextParallel), model.vocabSize],
+          elementCount: batch.microBatchSize * Math.ceil(config.maxSeqLength / contextParallel) * model.vocabSize,
+          bytes: lmHeadLogits.bytes,
+          bytesPerGPU: lmHeadLogits.bytesPerGPU,
+          precision: config.mixedPrecision as 'fp32' | 'fp16' | 'bf16',
+          formula: lmHeadLogits.formula,
+          description: 'LM Head output logits (stored for loss backward, CANNOT recompute)',
+        },
+      ],
     },
     communicationBuffers: {
       name: 'Communication Buffers',
@@ -624,6 +730,10 @@ export function calculateTrainingMemory(
     totalPerGPU,
     byPrecision,
     
+    // Recomputation info
+    layersStored,
+    layersPerGPU,
+    
     // Legacy fields
     parameters: parametersLegacy,
     gradients: gradientsLegacy,
@@ -667,6 +777,17 @@ function p2pTime(dataBytes: number, bandwidth: number): number {
 }
 
 /**
+ * Calculate All-to-All time (for Ulysses)
+ * All-to-All sends N/P elements to each of P-1 peers
+ */
+function allToAllTime(dataBytes: number, numRanks: number, bandwidth: number): number {
+  if (numRanks <= 1) return 0;
+  // Each rank sends (P-1)/P of its data
+  const factor = (numRanks - 1) / numRanks;
+  return (dataBytes * factor) / (bandwidth * 1e9) * 1000; // ms
+}
+
+/**
  * Calculate communication breakdown
  */
 export function calculateCommunication(
@@ -676,11 +797,15 @@ export function calculateCommunication(
 ): CommunicationBreakdown {
   const params = calculateModelParameters(model);
   const { parallelism, batch } = config;
-  const { dataParallel, tensorParallel, pipelineParallel, expertParallel, zeroStage } = parallelism;
+  const { dataParallel, tensorParallel, pipelineParallel, expertParallel, 
+          contextParallel, contextParallelType, zeroStage } = parallelism;
   const bytes = getPrecisionBytes(config.gradientPrecision);
   
   // Effective parameters per DP rank (after TP/PP sharding)
   const paramsPerRank = params.total / (tensorParallel * pipelineParallel);
+  
+  // Effective sequence length per GPU with Context Parallel
+  const seqLenPerGPU = config.maxSeqLength / contextParallel;
   
   // Data Parallel communication (gradient sync)
   let dataParallelVolume = 0;
@@ -700,7 +825,8 @@ export function calculateCommunication(
   }
   
   // Tensor Parallel communication (per layer, per micro-batch)
-  const activationSize = batch.microBatchSize * config.maxSeqLength * model.hiddenSize * bytes;
+  // Note: with CP, each GPU has seqLenPerGPU tokens
+  const activationSize = batch.microBatchSize * seqLenPerGPU * model.hiddenSize * bytes;
   // 4 AllReduce per layer (2 forward: attn + ffn, 2 backward: attn + ffn)
   const tpVolume = 4 * activationSize * (model.numLayers / pipelineParallel);
   const tensorParallelVolume = tpVolume * batch.gradientAccumulation;
@@ -716,12 +842,57 @@ export function calculateCommunication(
     const topK = model.numExpertsPerToken || 2;
     const moeLayerCount = model.numLayers / pipelineParallel;
     // All-to-All: dispatch + combine
-    expertParallelVolume = 2 * batch.microBatchSize * config.maxSeqLength * 
+    expertParallelVolume = 2 * batch.microBatchSize * seqLenPerGPU * 
       model.hiddenSize * topK * bytes * moeLayerCount * batch.gradientAccumulation;
   }
   
+  // ============ Context Parallel Communication ============
+  // Reference: DeepSpeed Ulysses paper, Ring Attention papers
+  let contextParallelVolume = 0;
+  if (contextParallel > 1) {
+    const layersPerStage = model.numLayers / pipelineParallel;
+    
+    if (contextParallelType === 'ulysses') {
+      // Ulysses: All-to-all for Q, K, V before attention, then all-to-all for output
+      // Per layer: 4 all-to-all operations (Q, K, V input + output)
+      // Each all-to-all moves (N/CP) * d elements
+      // Total per layer: 4 * (N/CP) * d * bytes
+      // For forward + backward: 2x
+      const perLayerVolume = 4 * seqLenPerGPU * model.hiddenSize * bytes;
+      contextParallelVolume = 2 * perLayerVolume * layersPerStage * batch.gradientAccumulation;
+    } else if (contextParallelType === 'ring') {
+      // Ring Attention: P2P ring communication of KV blocks
+      // Each GPU sends KV to next neighbor for CP-1 steps
+      // Per step: 2 * (N/CP) * d_kv * bytes (K + V)
+      // Total steps: CP - 1
+      // For forward + backward: 2x
+      const kvHeadDim = model.numKVHeads * model.headDim / tensorParallel;
+      const perStepVolume = 2 * seqLenPerGPU * kvHeadDim * bytes;
+      const numSteps = contextParallel - 1;
+      contextParallelVolume = 2 * perStepVolume * numSteps * layersPerStage * batch.gradientAccumulation;
+    } else if (contextParallelType === 'hybrid') {
+      // Hybrid: Ulysses within smaller groups, Ring across groups
+      // Calculate effective Ulysses degree (limited by KV heads)
+      const effectiveKVHeads = model.numKVHeads / tensorParallel;
+      const ulyssesDegree = Math.min(contextParallel, effectiveKVHeads);
+      const ringDegree = contextParallel / ulyssesDegree;
+      
+      // Ulysses component
+      const ulyssesSeqLen = config.maxSeqLength / ulyssesDegree;
+      const ulyssesVolume = 4 * ulyssesSeqLen * model.hiddenSize * bytes;
+      
+      // Ring component
+      const ringSeqLen = ulyssesSeqLen / ringDegree;
+      const kvHeadDim = model.numKVHeads * model.headDim / tensorParallel / ulyssesDegree;
+      const ringPerStep = 2 * ringSeqLen * kvHeadDim * bytes;
+      const ringVolume = ringPerStep * (ringDegree - 1);
+      
+      contextParallelVolume = 2 * (ulyssesVolume + ringVolume) * layersPerStage * batch.gradientAccumulation;
+    }
+  }
+  
   const totalVolume = dataParallelVolume + tensorParallelVolume + 
-    pipelineParallelVolume + expertParallelVolume + zeroVolume;
+    pipelineParallelVolume + expertParallelVolume + contextParallelVolume + zeroVolume;
   
   // Calculate times
   const intraNodeBW = cluster.intraNodeBandwidth;
@@ -748,12 +919,27 @@ export function calculateCommunication(
   const expertParallelTime = expertParallelVolume > 0 ? 
     (expertParallelVolume / (epBandwidth * 1e9)) * 1000 : 0;
   
+  // CP communication
+  // Ulysses benefits from NVLink (all-to-all is latency sensitive)
+  // Ring can work across nodes (P2P is bandwidth bound)
+  const cpBandwidth = contextParallel <= cluster.gpusPerNode ? intraNodeBW : interNodeBW;
+  let contextParallelTime = 0;
+  if (contextParallel > 1) {
+    if (contextParallelType === 'ulysses') {
+      // All-to-all time
+      contextParallelTime = allToAllTime(contextParallelVolume, contextParallel, cpBandwidth);
+    } else {
+      // Ring/Hybrid: P2P time
+      contextParallelTime = p2pTime(contextParallelVolume, cpBandwidth);
+    }
+  }
+  
   // ZeRO-3 time
   const zeroTime = zeroVolume > 0 ? 
     allGatherTime(zeroVolume / 2, dataParallel, dpBandwidth) * 2 : 0;
   
   const totalTime = dataParallelTime + tensorParallelTime + 
-    pipelineParallelTime + expertParallelTime + zeroTime;
+    pipelineParallelTime + expertParallelTime + contextParallelTime + zeroTime;
   
   // Pipeline bubble
   const bubbleRatio = pipelineParallel > 1 ? 
@@ -764,12 +950,14 @@ export function calculateCommunication(
     tensorParallelVolume,
     pipelineParallelVolume,
     expertParallelVolume,
+    contextParallelVolume,
     zeroVolume,
     totalVolume,
     dataParallelTime,
     tensorParallelTime,
     pipelineParallelTime,
     expertParallelTime,
+    contextParallelTime,
     zeroTime,
     totalTime,
     bubbleRatio,
@@ -821,12 +1009,13 @@ export function analyzeTrainingStep(
     communicationBreakdown.bubbleRatio;
   
   // Total time per step
-  // TP/PP communication can partially overlap with compute
+  // TP/PP/CP communication can partially overlap with compute
   const overlapFactor = 0.5; // Assume 50% overlap
   const effectiveCommTime = communicationBreakdown.dataParallelTime + 
     (communicationBreakdown.tensorParallelTime + 
      communicationBreakdown.pipelineParallelTime + 
-     communicationBreakdown.expertParallelTime) * (1 - overlapFactor) +
+     communicationBreakdown.expertParallelTime +
+     communicationBreakdown.contextParallelTime) * (1 - overlapFactor) +
     communicationBreakdown.zeroTime;
   
   const totalComputeTime = computeTime * config.batch.gradientAccumulation;

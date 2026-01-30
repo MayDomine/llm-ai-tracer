@@ -15,6 +15,12 @@ export interface BatchConfig {
 
 export type ZeROStage = 0 | 1 | 2 | 3;
 
+// Context Parallel types
+export type ContextParallelType = 
+  | 'ulysses'     // DeepSpeed Ulysses: all-to-all, limited by num_heads
+  | 'ring'        // Ring Attention: P2P ring, no head limit
+  | 'hybrid';     // Ulysses + Ring combined
+
 export interface ParallelismConfig {
   // Core parallelism dimensions
   dataParallel: number;         // DP size
@@ -22,12 +28,16 @@ export interface ParallelismConfig {
   pipelineParallel: number;     // PP size
   expertParallel: number;       // EP size (for MoE)
   
+  // Context Parallel (for long sequences)
+  contextParallel: number;      // CP size (sequence dimension parallelism)
+  contextParallelType: ContextParallelType; // Ulysses vs Ring vs Hybrid
+  
   // Additional options
   sequenceParallel: boolean;    // SP (usually enabled with TP)
   zeroStage: ZeROStage;         // ZeRO optimization level
   
   // Derived
-  totalGPUs: number;            // DP × TP × PP × EP
+  totalGPUs: number;            // DP × TP × PP × EP × CP
 }
 
 // ============ Memory Optimization ============
@@ -151,6 +161,10 @@ export interface TrainingMemoryBreakdown {
     bf16: number;
   };
   
+  // Recomputation info
+  layersStored: number;           // Number of layers stored (affected by recomputation)
+  layersPerGPU: number;           // Total layers per GPU stage (numLayers / PP)
+  
   // Legacy fields for compatibility
   parameters: number;
   gradients: number;
@@ -173,6 +187,7 @@ export interface CommunicationBreakdown {
   tensorParallelVolume: number;   // Activation AllReduce
   pipelineParallelVolume: number; // P2P activations/gradients
   expertParallelVolume: number;   // All-to-All for MoE
+  contextParallelVolume: number;  // Context Parallel (Ulysses all-to-all or Ring P2P)
   zeroVolume: number;             // Parameter AllGather (ZeRO-3)
   
   totalVolume: number;
@@ -182,6 +197,7 @@ export interface CommunicationBreakdown {
   tensorParallelTime: number;
   pipelineParallelTime: number;
   expertParallelTime: number;
+  contextParallelTime: number;    // Context Parallel communication time
   zeroTime: number;
   
   totalTime: number;
