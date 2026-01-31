@@ -427,7 +427,7 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
               {/* DP (computed) */}
               <div className="flex items-center justify-between text-xs">
                 <span className="text-gray-400">
-                  DP = GPUs/(CP×TP×PP)
+                  {isMoE ? 'Attn DP' : 'DP'} = GPUs/(CP×TP×PP)
                 </span>
                 <span className="font-mono text-blue-400">{dataParallel}</span>
               </div>
@@ -528,17 +528,15 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                     ))}
                   </div>
                   <div className="text-[10px] text-gray-500">
-                    MoE: Attention uses TP={tensorParallel}, Experts use EP={expertParallel}
-                    {modelConfig.numExperts && ` (${modelConfig.numExperts} experts ÷ EP${expertParallel} = ${Math.floor(modelConfig.numExperts / expertParallel)}/GPU)`}
+                    Attn: DP{dataParallel}×TP{tensorParallel}, FFN: EP{expertParallel}
+                    {modelConfig.numExperts && ` (${modelConfig.numExperts}÷${expertParallel}=${Math.floor(modelConfig.numExperts / expertParallel)} experts/GPU)`}
                   </div>
-                  {expertParallel > dataParallel * tensorParallel && (
-                    <div className="text-[10px] text-yellow-500">
-                      ⚠ EP ({expertParallel}) &gt; DP×TP ({dataParallel * tensorParallel}) - EP should be ≤ DP×TP
-                    </div>
-                  )}
+                  <div className="text-[10px] text-gray-600 mt-0.5">
+                    EP 与 DP 共享同一组 GPU，不额外消耗卡数
+                  </div>
                   {modelConfig.numExperts && modelConfig.numExperts % expertParallel !== 0 && (
                     <div className="text-[10px] text-yellow-500">
-                      ⚠ EP ({expertParallel}) does not divide num_experts ({modelConfig.numExperts})
+                      ⚠ EP ({expertParallel}) 无法整除 experts ({modelConfig.numExperts})
                     </div>
                   )}
                 </div>
