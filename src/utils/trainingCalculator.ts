@@ -485,7 +485,7 @@ export function calculateTrainingMemory(
   const totalParams = params.total;
   
   const { parallelism, memoryOptimization, batch } = config;
-  const { tensorParallel, pipelineParallel, dataParallel, sequenceParallel, zeroStage, effectiveDataParallel } = parallelism;
+  const { tensorParallel, pipelineParallel, dataParallel, sequenceParallel, zeroStage, effectiveDataParallel, expertParallel } = parallelism;
   
   // ZeRO/FSDP shards across the entire DP group = DP_batch × CP
   // CP is a special form of DP that splits sequence instead of batch
@@ -494,8 +494,22 @@ export function calculateTrainingMemory(
   const modelPrecisionBytes = getPrecisionBytes(config.mixedPrecision);
   const fp32Bytes = 4;
   
-  // Effective params per GPU after TP/PP sharding
-  const paramsAfterTPPP = totalParams / (tensorParallel * pipelineParallel);
+  // For MoE models, attention and FFN have different sharding:
+  // - Attention: ÷ (TP × PP)
+  // - FFN/Experts: ÷ (EP × PP) for MoE, ÷ (TP × PP) for dense
+  // - Embedding, LM Head, LayerNorm: follow attention sharding
+  const isMoE = model.ffnType === 'moe';
+  const EP = isMoE ? expertParallel : tensorParallel; // EP for FFN, TP for dense
+  
+  // Params breakdown by module type (all divide by PP for pipeline stages)
+  const attnParamsPerGPU = params.attention / (tensorParallel * pipelineParallel);
+  const ffnParamsPerGPU = params.ffn / (EP * pipelineParallel); // EP for MoE, TP for dense
+  const embeddingParamsPerGPU = params.embedding / pipelineParallel; // Embedding not sharded by TP typically
+  const lmHeadParamsPerGPU = params.lmHead / (tensorParallel * pipelineParallel);
+  const layerNormParamsPerGPU = params.layerNorm / pipelineParallel;
+  
+  // Total params per GPU after parallelism sharding
+  const paramsAfterTPPP = attnParamsPerGPU + ffnParamsPerGPU + embeddingParamsPerGPU + lmHeadParamsPerGPU + layerNormParamsPerGPU;
   
   // ============ Model Weights ============
   // Stored in user-defined dtype
@@ -627,10 +641,16 @@ export function calculateTrainingMemory(
   const DP = dataParallel;
   const CP = contextParallel;
   const DP_eff = zeroShardingDimension; // DP × CP for ZeRO sharding
+  const EPVal = expertParallel;
   
   // Format the sharding dimension for formulas
   const shardingLabel = CP > 1 ? `DP×CP` : `DP`;
   const shardingValue = CP > 1 ? `${DP}×${CP}=${DP_eff}` : `${DP}`;
+  
+  // For MoE, show different sharding for Attention vs FFN
+  const moeNote = isMoE 
+    ? `\n(Attn: TP×PP=${TP}×${PP}, FFN: EP×PP=${EPVal}×${PP})`
+    : '';
   
   const components = {
     modelWeights: {
@@ -638,10 +658,10 @@ export function calculateTrainingMemory(
       bytes: modelWeightsTotal,
       bytesPerGPU: modelWeightsPerGPU,
       precision: config.mixedPrecision as 'fp32' | 'fp16' | 'bf16',
-      description: `Model parameters in ${config.mixedPrecision.toUpperCase()}`,
+      description: `Model parameters in ${config.mixedPrecision.toUpperCase()}${isMoE ? ' (MoE: Attn÷TP, FFN÷EP)' : ''}`,
       formula: zeroStage === 3 
-        ? `P / (TP × PP × ${shardingLabel}) × ${modelPrecisionBytes} = ${(P/1e9).toFixed(2)}B / (${TP} × ${PP} × ${shardingValue}) × ${modelPrecisionBytes}`
-        : `P / (TP × PP) × ${modelPrecisionBytes} = ${(P/1e9).toFixed(2)}B / (${TP} × ${PP}) × ${modelPrecisionBytes}`,
+        ? `Attn/(TP×PP×${shardingLabel}) + FFN/(${isMoE ? 'EP' : 'TP'}×PP×${shardingLabel})${moeNote}`
+        : `Attn/(TP×PP) + FFN/(${isMoE ? 'EP' : 'TP'}×PP)${moeNote}`,
       isRequired: true,
     },
     masterWeights: {
