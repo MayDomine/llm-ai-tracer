@@ -135,7 +135,8 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
       effectiveDataParallel: effectiveDP, // DP × CP for ZeRO sharding
       sequenceParallel,
       zeroStage,
-      totalGPUs: dataParallel * tensorParallel * pipelineParallel * expertParallel * contextParallel,
+      // EP doesn't consume additional GPUs - experts distributed within DP group
+      totalGPUs: dataParallel * tensorParallel * pipelineParallel * contextParallel,
     },
     memoryOptimization: {
       recomputation,

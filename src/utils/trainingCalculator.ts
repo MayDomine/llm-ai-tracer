@@ -112,7 +112,8 @@ export function validateParallelism(
   const { dataParallel, tensorParallel, pipelineParallel, expertParallel, contextParallel, contextParallelType } = parallelism;
   
   // Check total GPUs (now includes CP)
-  const requiredGPUs = dataParallel * tensorParallel * pipelineParallel * expertParallel * contextParallel;
+  // EP doesn't consume additional GPUs - experts are distributed within the DP×TP group
+  const requiredGPUs = dataParallel * tensorParallel * pipelineParallel * contextParallel;
   if (requiredGPUs > cluster.totalGPUs) {
     errors.push(`Configuration requires ${requiredGPUs} GPUs but only ${cluster.totalGPUs} available`);
   }

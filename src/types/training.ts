@@ -102,7 +102,7 @@ export interface ParallelismConfig {
   zeroStage: ZeROStage;         // ZeRO optimization level
   
   // Derived
-  totalGPUs: number;            // DP_batch × CP × TP × PP × EP
+  totalGPUs: number;            // DP_batch × CP × TP × PP (EP doesn't consume extra GPUs)
 }
 
 // ============ Memory Optimization ============
