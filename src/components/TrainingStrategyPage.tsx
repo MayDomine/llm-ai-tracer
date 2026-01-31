@@ -97,12 +97,14 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
 
   // Calculate derived values
   // Note: CP is part of the data parallel dimension (splits sequence, not batch)
-  // Total GPUs = DP_batch × CP × TP × PP × EP
+  // Total GPUs = DP_batch × CP × TP × PP
+  // EP is NOT a separate GPU dimension - it's how experts are distributed within DP×TP group
   // Effective DP for ZeRO sharding = DP_batch × CP
   const dataParallelBatch = useMemo(() => {
-    // DP_batch = GPUs / (CP × TP × PP × EP)
-    return Math.floor(numGPUs / (contextParallel * tensorParallel * pipelineParallel * expertParallel));
-  }, [numGPUs, contextParallel, tensorParallel, pipelineParallel, expertParallel]);
+    // DP_batch = GPUs / (CP × TP × PP)
+    // EP doesn't consume additional GPUs - it distributes experts across existing parallel groups
+    return Math.floor(numGPUs / (contextParallel * tensorParallel * pipelineParallel));
+  }, [numGPUs, contextParallel, tensorParallel, pipelineParallel]);
   
   // For backward compatibility, dataParallel represents the batch DP dimension
   const dataParallel = dataParallelBatch;
@@ -425,7 +427,7 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
               {/* DP (computed) */}
               <div className="flex items-center justify-between text-xs">
                 <span className="text-gray-400">
-                  DP = GPUs/(CP×TP×PP{isMoE && expertParallel > 1 ? '×EP' : ''})
+                  DP = GPUs/(CP×TP×PP)
                 </span>
                 <span className="font-mono text-blue-400">{dataParallel}</span>
               </div>
@@ -527,8 +529,18 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                   </div>
                   <div className="text-[10px] text-gray-500">
                     MoE: Attention uses TP={tensorParallel}, Experts use EP={expertParallel}
-                    {modelConfig.numExperts && ` (${modelConfig.numExperts} experts ÷ EP${expertParallel} = ${modelConfig.numExperts / expertParallel}/GPU)`}
+                    {modelConfig.numExperts && ` (${modelConfig.numExperts} experts ÷ EP${expertParallel} = ${Math.floor(modelConfig.numExperts / expertParallel)}/GPU)`}
                   </div>
+                  {expertParallel > dataParallel * tensorParallel && (
+                    <div className="text-[10px] text-yellow-500">
+                      ⚠ EP ({expertParallel}) &gt; DP×TP ({dataParallel * tensorParallel}) - EP should be ≤ DP×TP
+                    </div>
+                  )}
+                  {modelConfig.numExperts && modelConfig.numExperts % expertParallel !== 0 && (
+                    <div className="text-[10px] text-yellow-500">
+                      ⚠ EP ({expertParallel}) does not divide num_experts ({modelConfig.numExperts})
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -781,6 +793,17 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                     }`}
                     style={{ width: `${Math.min(100, analysis.memoryEfficiency * 100)}%` }}
                   />
+                </div>
+              </div>
+
+              {/* Disclaimer */}
+              <div className="glass rounded-lg p-2 border border-gray-600/30">
+                <div className="flex items-start gap-1.5">
+                  <Info className="w-3 h-3 text-gray-500 mt-0.5 flex-shrink-0" />
+                  <div className="text-[10px] text-gray-500 leading-relaxed">
+                    <span className="font-medium text-gray-400">注意：</span>
+                    以上 MFU、计算时间、通信时间等预测仅为粗略估计。实际性能受硬件拓扑、NCCL 实现、内核调度、内存碎片等因素影响，可能与预测值有较大差异。
+                  </div>
                 </div>
               </div>
             </>
