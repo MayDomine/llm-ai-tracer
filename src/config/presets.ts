@@ -272,12 +272,49 @@ export const PRESET_MODELS: ModelConfig[] = [
 
 // ============ 扩展硬件配置类型 ============
 
+import { GPU_SPECS, type GPUSpec, QUANTIZATION_SPECS, type QuantizationSpec } from './formulaConstants';
+
 export interface ExtendedHardwareConfig extends HardwareConfig {
   memoryCapacity: number;      // GPU显存容量 (GB)
   nvlinkBandwidth?: number;    // NVLink带宽 (GB/s, 节点内)
   networkBandwidth?: number;   // 网络带宽 (GB/s, 跨节点)
   gpusPerNode?: number;        // 每节点GPU数量
+  
+  // Extended specs from GPU database
+  architecture?: string;
+  fp32TFLOPS?: number;
+  int8TOPS?: number;
+  fp8TFLOPS?: number;
+  memoryType?: string;
+  tdpWatts?: number;
+  rooflinePointFP16?: number;  // FLOP/Byte
 }
+
+/**
+ * Convert GPUSpec to ExtendedHardwareConfig
+ */
+export function gpuSpecToHardwareConfig(spec: GPUSpec, gpusPerNode: number = 8): ExtendedHardwareConfig {
+  return {
+    name: spec.name,
+    computeCapability: spec.fp16TFLOPS,
+    memoryBandwidth: spec.memoryBandwidthTBs,
+    memoryCapacity: spec.memoryGB,
+    nvlinkBandwidth: spec.nvlinkBandwidthGBs,
+    networkBandwidth: 50,  // Default InfiniBand HDR
+    gpusPerNode,
+    architecture: spec.architecture,
+    fp32TFLOPS: spec.fp32TFLOPS,
+    int8TOPS: spec.int8TOPS,
+    fp8TFLOPS: spec.fp8TFLOPS,
+    memoryType: spec.memoryType,
+    tdpWatts: spec.tdpWatts,
+    rooflinePointFP16: spec.rooflinePointFP16,
+  };
+}
+
+// Re-export for convenience
+export { GPU_SPECS, QUANTIZATION_SPECS };
+export type { GPUSpec, QuantizationSpec };
 
 // ============ 预设硬件配置 ============
 

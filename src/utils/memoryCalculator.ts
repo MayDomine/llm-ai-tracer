@@ -8,9 +8,12 @@
  * - Gradients (training)
  * - Optimizer states (training)
  * 
- * References:
- * - vLLM memory modeling
- * - Megatron-LM memory estimation
+ * Formula References:
+ * - KV Cache: 2 × B × S × L × h_kv × d_h × bytes (vLLM)
+ * - Model Weights: P × bytes / (TP × PP) (Megatron-LM)
+ * - Adam States: 8 × P (momentum FP32 + variance FP32)
+ * - Activation Factor: ~12 with FlashAttention, ~34+ without
+ *   Citation: "Reducing Activation Recomputation in Large Transformer Models" (Korthikanti et al., 2023)
  */
 
 import type { 
@@ -22,6 +25,32 @@ import type {
   ParallelConfig
 } from '../types/model';
 import { DTYPE_BYTES, calculateModelParameters } from './calculator';
+// Unified activation calculator is available for detailed calculations:
+// import { calculateTotalActivationMemory, calculateActivationFactor } from './activationCalculator';
+
+// ============ Configurable Memory Assumptions ============
+
+export interface MemoryCalculatorAssumptions {
+  // Activation factor (simplified calculation)
+  // Range: 10-16 with FlashAttention, 30+ without
+  activationFactor: number;
+  
+  // Framework overhead ratio (0.0 - 0.2)
+  frameworkOverheadRatio: number;
+  
+  // Minimum framework overhead in bytes
+  frameworkOverheadMinBytes: number;
+  
+  // Whether FlashAttention is enabled (affects activation memory)
+  useFlashAttention: boolean;
+}
+
+export const DEFAULT_MEMORY_ASSUMPTIONS: MemoryCalculatorAssumptions = {
+  activationFactor: 12,                      // Conservative with FlashAttention
+  frameworkOverheadRatio: 0.08,              // 8% typical
+  frameworkOverheadMinBytes: 500 * 1024 * 1024, // 500MB minimum
+  useFlashAttention: true,
+};
 
 // 颜色映射
 const MEMORY_COLORS = {
@@ -104,18 +133,22 @@ export function calculateKVCacheMemory(
  * Per layer activations (approximate):
  * - Input to layer: batch × seq × hidden
  * - QKV projections: batch × seq × (3 × hidden) for MHA
- * - Attention scores: batch × heads × seq × seq
+ * - Attention scores: batch × heads × seq × seq (NOT stored with FlashAttention)
  * - Attention output: batch × seq × hidden
  * - FFN intermediate: batch × seq × intermediate_size
  * - Various residual connections
  * 
- * Total per layer ≈ batch × seq × hidden × (10-14) depending on implementation
+ * Total per layer ≈ batch × seq × hidden × (10-14) with FlashAttention
+ * Total per layer ≈ batch × seq × hidden × (30-40) without FlashAttention
+ * 
+ * Citation: "Reducing Activation Recomputation in Large Transformer Models" (Korthikanti et al., 2023)
  */
 export function calculateActivationsMemory(
   modelConfig: ModelConfig,
   inferenceConfig: InferenceConfig,
   useGradientCheckpointing: boolean = false,
-  parallelConfig?: ParallelConfig
+  parallelConfig?: ParallelConfig,
+  assumptions: MemoryCalculatorAssumptions = DEFAULT_MEMORY_ASSUMPTIONS
 ): number {
   const { hiddenSize, numLayers, numAttentionHeads, intermediateSize } = modelConfig;
   const { batchSize, seqLen, mode, dtype } = inferenceConfig;
@@ -124,25 +157,26 @@ export function calculateActivationsMemory(
   // 实际序列长度
   const effectiveSeqLen = mode === 'decode' ? 1 : seqLen;
   
-  // 基础激活内存因子 (经验值)
+  // 基础激活内存因子 (可配置)
   // 详细breakdown:
   // - Layer input: 1 × hidden
-  // - Q, K, V: 3 × hidden
-  // - Attention scores: heads × seq (对于长序列这个可能很大)
+  // - Q, K, V: 3 × hidden (TP sharded)
+  // - Attention scores: heads × seq × seq (NOT stored with FlashAttention!)
   // - Attention output: 1 × hidden
-  // - FFN up: 1 × intermediate
-  // - FFN gate (gated): 1 × intermediate
+  // - FFN up: 1 × intermediate (TP sharded)
+  // - FFN gate (gated): 1 × intermediate (TP sharded)
   // - FFN down input: 1 × intermediate
   // - Residuals: 2 × hidden
-  // 总计约 10-14 × hidden (不含attention scores)
+  // 总计约 10-14 × hidden with FlashAttention (不含attention scores)
+  // 总计约 30-40 × hidden without FlashAttention (含 heads × seq × seq)
   
-  const activationFactor = 12; // 保守估计
+  const activationFactor = assumptions.activationFactor;
   
   let perLayerActivations = batchSize * effectiveSeqLen * hiddenSize * activationFactor * bytesPerElement;
   
-  // 加上attention scores内存 (可能很大)
-  // 对于prefill/training: batch × heads × seq × seq
-  if (mode !== 'decode') {
+  // If FlashAttention is NOT used, add O(S²) attention scores memory
+  // This is the key insight from FlashAttention - avoiding this storage
+  if (!assumptions.useFlashAttention && mode !== 'decode') {
     const attentionScoresMemory = batchSize * numAttentionHeads * seqLen * seqLen * bytesPerElement;
     perLayerActivations += attentionScoresMemory;
   }
@@ -239,13 +273,21 @@ export function calculateOptimizerStatesMemory(
 
 /**
  * 估算框架开销 (CUDA context, PyTorch buffers, etc.)
+ * 
+ * Components:
+ * - CUDA context: ~200-500MB per GPU
+ * - PyTorch allocator overhead: ~2-5% of allocations
+ * - NCCL buffers: depends on world size and message size
+ * - Temporary computation buffers: variable
+ * 
+ * Typical range: 5-10% of base memory, minimum 500MB
  */
 export function calculateFrameworkOverhead(
-  baseMemory: number
+  baseMemory: number,
+  assumptions: MemoryCalculatorAssumptions = DEFAULT_MEMORY_ASSUMPTIONS
 ): number {
-  // 经验值: 约5-10%的额外开销,最少500MB
-  const overheadRatio = 0.08;
-  const minOverhead = 500 * 1024 * 1024; // 500MB
+  const overheadRatio = assumptions.frameworkOverheadRatio;
+  const minOverhead = assumptions.frameworkOverheadMinBytes;
   return Math.max(baseMemory * overheadRatio, minOverhead);
 }
 

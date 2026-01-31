@@ -13,6 +13,7 @@ import {
   Info,
   BarChart3,
   Cpu,
+  HelpCircle,
 } from 'lucide-react';
 import type { ModelConfig, HardwareConfig } from '../types/model';
 import type {
@@ -35,18 +36,25 @@ interface TrainingStrategyPageProps {
   hardwareConfig: HardwareConfig;
 }
 
-// Default cluster topology from hardware config
+// Create cluster topology with user-specified network settings
+interface ClusterConfig {
+  numGPUs: number;
+  numNodes: number;
+  gpusPerNode: number;
+  intraNodeBandwidth: number;  // GB/s bidirectional
+  interNodeBandwidth: number;  // GB/s bidirectional
+}
+
 function createClusterTopology(
   hardware: ExtendedHardwareConfig,
-  numGPUs: number
+  clusterConfig: ClusterConfig
 ): ClusterTopology {
-  const gpusPerNode = hardware.gpusPerNode || 8;
   return {
-    totalGPUs: numGPUs,
-    gpusPerNode,
-    numNodes: Math.ceil(numGPUs / gpusPerNode),
-    intraNodeBandwidth: hardware.nvlinkBandwidth || 300,
-    interNodeBandwidth: hardware.networkBandwidth || 50,
+    totalGPUs: clusterConfig.numGPUs,
+    gpusPerNode: clusterConfig.gpusPerNode,
+    numNodes: clusterConfig.numNodes,
+    intraNodeBandwidth: clusterConfig.intraNodeBandwidth,
+    interNodeBandwidth: clusterConfig.interNodeBandwidth,
     gpuMemoryGB: hardware.memoryCapacity || 80,
     gpuComputeTFLOPS: hardware.computeCapability,
     gpuMemoryBandwidthTBs: hardware.memoryBandwidth,
@@ -57,18 +65,27 @@ function createClusterTopology(
 export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingStrategyPageProps) {
   // State
   const [numGPUs, setNumGPUs] = useState(8);
-  const [globalBatchSize, setGlobalBatchSize] = useState(1024);
+  const [globalBatchSize, setGlobalBatchSize] = useState(8);  // Realistic default
   const [microBatchSize, setMicroBatchSize] = useState(1);
   const [maxSeqLength, setMaxSeqLength] = useState(2048);
+  
+  // Cluster topology state
+  const [numNodes, setNumNodes] = useState(1);
+  const [gpusPerNode, setGpusPerNode] = useState(8);
+  const [intraNodeBandwidth, setIntraNodeBandwidth] = useState(450); // NVLink 4.0: 450 GB/s bidirectional per GPU pair
+  const [interNodeBandwidth, setInterNodeBandwidth] = useState(50); // InfiniBand 400G: ~50 GB/s bidirectional
   
   // Parallelism state
   const [tensorParallel, setTensorParallel] = useState(1);
   const [pipelineParallel, setPipelineParallel] = useState(1);
-  const [expertParallel] = useState(1);
+  const [expertParallel, setExpertParallel] = useState(1);
   const [contextParallel, setContextParallel] = useState(1);
   const [contextParallelType, setContextParallelType] = useState<'ulysses' | 'ring' | 'hybrid'>('ulysses');
   const [sequenceParallel, setSequenceParallel] = useState(false);
   const [zeroStage, setZeroStage] = useState<ZeROStage>(0);
+  
+  // Check if current model is MoE
+  const isMoE = modelConfig.ffnType === 'moe';
   
   // Memory optimization state
   const [recomputation, setRecomputation] = useState<RecomputationStrategy>('none');
@@ -79,13 +96,25 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
   const [expandedSection, setExpandedSection] = useState<string | null>('parallelism');
 
   // Calculate derived values
-  const dataParallel = useMemo(() => {
-    return Math.floor(numGPUs / (tensorParallel * pipelineParallel * expertParallel * contextParallel));
-  }, [numGPUs, tensorParallel, pipelineParallel, expertParallel, contextParallel]);
+  // Note: CP is part of the data parallel dimension (splits sequence, not batch)
+  // Total GPUs = DP_batch × CP × TP × PP × EP
+  // Effective DP for ZeRO sharding = DP_batch × CP
+  const dataParallelBatch = useMemo(() => {
+    // DP_batch = GPUs / (CP × TP × PP × EP)
+    return Math.floor(numGPUs / (contextParallel * tensorParallel * pipelineParallel * expertParallel));
+  }, [numGPUs, contextParallel, tensorParallel, pipelineParallel, expertParallel]);
+  
+  // For backward compatibility, dataParallel represents the batch DP dimension
+  const dataParallel = dataParallelBatch;
+  
+  // Effective DP for ZeRO/FSDP sharding = DP_batch × CP
+  // CP is a special form of DP that splits sequence instead of batch
+  const effectiveDP = dataParallelBatch * contextParallel;
 
   const gradientAccumulation = useMemo(() => {
-    return Math.max(1, Math.ceil(globalBatchSize / (dataParallel * microBatchSize)));
-  }, [globalBatchSize, dataParallel, microBatchSize]);
+    // GBS is divided by batch DP dimension (not CP, since CP doesn't change batch size)
+    return Math.max(1, Math.ceil(globalBatchSize / (dataParallelBatch * microBatchSize)));
+  }, [globalBatchSize, dataParallelBatch, microBatchSize]);
 
   // Build config
   const trainingConfig: TrainingConfig = useMemo(() => ({
@@ -101,6 +130,7 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
       expertParallel,
       contextParallel,
       contextParallelType,
+      effectiveDataParallel: effectiveDP, // DP × CP for ZeRO sharding
       sequenceParallel,
       zeroStage,
       totalGPUs: dataParallel * tensorParallel * pipelineParallel * expertParallel * contextParallel,
@@ -116,13 +146,19 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
     gradientPrecision: 'fp32',
   }), [
     globalBatchSize, microBatchSize, gradientAccumulation,
-    dataParallel, tensorParallel, pipelineParallel, expertParallel, contextParallel, contextParallelType,
+    dataParallel, tensorParallel, pipelineParallel, expertParallel, contextParallel, contextParallelType, effectiveDP,
     sequenceParallel, zeroStage, recomputation, maxSeqLength, precision, flashAttention
   ]);
 
   const cluster = useMemo(() => 
-    createClusterTopology(hardwareConfig as ExtendedHardwareConfig, numGPUs),
-    [hardwareConfig, numGPUs]
+    createClusterTopology(hardwareConfig as ExtendedHardwareConfig, {
+      numGPUs,
+      numNodes,
+      gpusPerNode,
+      intraNodeBandwidth,
+      interNodeBandwidth,
+    }),
+    [hardwareConfig, numGPUs, numNodes, gpusPerNode, intraNodeBandwidth, interNodeBandwidth]
   );
 
   // Validation
@@ -267,6 +303,65 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                   </div>
                 </div>
               </div>
+
+              {/* Cluster Topology */}
+              <div className="pt-2 border-t border-gray-700/50">
+                <div className="flex items-center gap-1 mb-2">
+                  <span className="text-xs text-gray-400 font-medium">Cluster Topology</span>
+                  <button
+                    onClick={() => alert('Cluster topology settings:\n\n• Nodes × GPUs/Node = Total GPUs\n• Intra-node: NVLink-like topology (uniform P2P/collective bandwidth)\n• Inter-node: Network bandwidth (e.g., InfiniBand/RoCE)\n\nBandwidth values are bidirectional per GPU pair.')}
+                    className="text-gray-500 hover:text-gray-300 transition-colors"
+                  >
+                    <HelpCircle className="w-3 h-3" />
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-2 mb-2">
+                  <NumberInput
+                    label="Nodes"
+                    value={numNodes}
+                    onChange={(v) => {
+                      setNumNodes(v);
+                      setNumGPUs(v * gpusPerNode);
+                    }}
+                    min={1}
+                    validate={(v) => v >= 1 ? null : 'At least 1'}
+                  />
+                  <NumberInput
+                    label="GPUs/Node"
+                    value={gpusPerNode}
+                    onChange={(v) => {
+                      setGpusPerNode(v);
+                      setNumGPUs(numNodes * v);
+                    }}
+                    min={1}
+                    validate={(v) => v >= 1 ? null : 'At least 1'}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <NumberInput
+                    label="Intra-BW"
+                    hint="GB/s"
+                    value={intraNodeBandwidth}
+                    onChange={setIntraNodeBandwidth}
+                    min={1}
+                    validate={(v) => v >= 1 ? null : 'Must be positive'}
+                  />
+                  <NumberInput
+                    label="Inter-BW"
+                    hint="GB/s"
+                    value={interNodeBandwidth}
+                    onChange={setInterNodeBandwidth}
+                    min={1}
+                    validate={(v) => v >= 1 ? null : 'Must be positive'}
+                  />
+                </div>
+                <div className="text-[10px] text-gray-500 mt-1">
+                  {numNodes} nodes × {gpusPerNode} GPUs = {numNodes * gpusPerNode} total
+                  {numNodes * gpusPerNode !== numGPUs && (
+                    <span className="text-yellow-500 ml-1">(≠ {numGPUs} selected)</span>
+                  )}
+                </div>
+              </div>
             </div>
           </ConfigSection>
 
@@ -329,9 +424,19 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
 
               {/* DP (computed) */}
               <div className="flex items-center justify-between text-xs">
-                <span className="text-gray-400">DP = GPUs/(TP×PP)</span>
+                <span className="text-gray-400">
+                  DP = GPUs/(CP×TP×PP{isMoE && expertParallel > 1 ? '×EP' : ''})
+                </span>
                 <span className="font-mono text-blue-400">{dataParallel}</span>
               </div>
+              
+              {/* Effective DP for ZeRO (only show if CP > 1) */}
+              {contextParallel > 1 && (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-500">ZeRO shards = DP×CP</span>
+                  <span className="font-mono text-purple-400">{effectiveDP}</span>
+                </div>
+              )}
 
               {/* SP */}
               <div className="flex items-center justify-between">
@@ -398,9 +503,46 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                 )}
               </div>
 
+              {/* EP (Expert Parallel) - Only for MoE models */}
+              {isMoE && (
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs text-gray-400">EP (Expert Parallel)</label>
+                    <span className="font-mono text-[10px] text-yellow-400">{expertParallel}</span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-0.5 mb-1">
+                    {[1, 2, 4, 8].filter(ep => !modelConfig.numExperts || modelConfig.numExperts % ep === 0).map((ep) => (
+                      <button
+                        key={ep}
+                        onClick={() => setExpertParallel(ep)}
+                        className={`px-1 py-1 text-[10px] rounded transition-all ${
+                          expertParallel === ep
+                            ? 'bg-yellow-600/50 text-yellow-300'
+                            : 'bg-gray-800/50 text-gray-400 hover:bg-gray-700/50'
+                        }`}
+                      >
+                        {ep}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-gray-500">
+                    MoE: Attention uses TP={tensorParallel}, Experts use EP={expertParallel}
+                    {modelConfig.numExperts && ` (${modelConfig.numExperts} experts ÷ EP${expertParallel} = ${modelConfig.numExperts / expertParallel}/GPU)`}
+                  </div>
+                </div>
+              )}
+
               {/* ZeRO Stage */}
               <div>
-                <label className="text-xs text-gray-400 block mb-1">ZeRO</label>
+                <div className="flex items-center gap-1 mb-1">
+                  <label className="text-xs text-gray-400">ZeRO</label>
+                  <button
+                    onClick={() => alert('ZeRO Optimization Stages:\n\n• ZeRO-0 (DDP): No sharding, AllReduce gradients after GA steps\n• ZeRO-1: Shard optimizer states, AllReduce gradients\n• ZeRO-2: Shard optimizer + gradients (ReduceScatter + AllGather)\n• ZeRO-3/FSDP: Shard everything, AllGather params for each layer\n\n⚠️ ZeRO-2 with Gradient Accumulation:\nWith GA > 1, gradients are ReduceScattered every micro-batch to avoid keeping full gradient buffer. This matches Megatron-LM/DeepSpeed behavior.\n\nAlternatively, keeping full gradient buffer and only ReduceScatter at step end degrades memory to ZeRO-1 level.')}
+                    className="text-gray-500 hover:text-gray-300 transition-colors"
+                  >
+                    <HelpCircle className="w-3 h-3" />
+                  </button>
+                </div>
                 <div className="grid grid-cols-4 gap-0.5">
                   {([0, 1, 2, 3] as ZeROStage[]).map((stage) => (
                     <button
@@ -419,7 +561,9 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                 <div className="text-[10px] text-gray-500 mt-1">
                   {zeroStage === 0 && 'Standard DDP - no optimizer sharding'}
                   {zeroStage === 1 && 'Shard optimizer states across DP ranks'}
-                  {zeroStage === 2 && 'Shard optimizer + gradients'}
+                  {zeroStage === 2 && (gradientAccumulation > 1 
+                    ? `Shard opt+grad (ReduceScatter×${gradientAccumulation}/step)`
+                    : 'Shard optimizer + gradients')}
                   {zeroStage === 3 && 'Shard optimizer + gradients + parameters (FSDP)'}
                 </div>
               </div>
@@ -911,6 +1055,39 @@ function MemoryModuleSection({
             </div>
           </MemoryModuleCard>
         )}
+
+        {/* LM Head Logits - NOT per-layer, computed only once */}
+        <MemoryModuleCard
+          name="LM Head Logits"
+          icon={<Cpu className="w-5 h-5" />}
+          color="from-rose-500 to-pink-500"
+          totalBytes={memoryBreakdown.components.lmHeadLogits.bytesPerGPU}
+          description={memoryBreakdown.components.lmHeadLogits.description}
+          isExpanded={expandedModule === 'lmhead'}
+          onToggle={() => setExpandedModule(expandedModule === 'lmhead' ? null : 'lmhead')}
+        >
+          <div className="px-4 py-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-sm">Logits Output</span>
+                <span className="font-mono text-xs text-gray-500">
+                  {memoryBreakdown.components.lmHeadLogits.tensors?.[0]?.shape || '[B, S, V]'}
+                </span>
+                <PrecisionBadge precision={memoryBreakdown.components.lmHeadLogits.precision} />
+                <FormulaButton 
+                  formula={memoryBreakdown.components.lmHeadLogits.formula} 
+                  title="LM Head Logits" 
+                />
+              </div>
+              <div className="font-mono text-sm">
+                {formatBytes(memoryBreakdown.components.lmHeadLogits.bytesPerGPU)}
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              Stored for cross-entropy loss backward. <span className="text-rose-400 font-medium">Cannot be recomputed!</span>
+            </p>
+          </div>
+        </MemoryModuleCard>
 
         {/* Communication Buffers Module */}
         <MemoryModuleCard

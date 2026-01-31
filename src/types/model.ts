@@ -3,6 +3,87 @@
 export type FFNType = 'gpt' | 'gated' | 'moe';
 export type AttentionType = 'mha' | 'gqa';
 
+// ============ Quantization Types ============
+
+/**
+ * Supported precision/quantization types
+ * 
+ * FP32: Full precision (32 bits)
+ * FP16/BF16: Half precision (16 bits)
+ * FP8: 8-bit floating point (Hopper+)
+ *   - E4M3: 4 exponent, 3 mantissa (weights)
+ *   - E5M2: 5 exponent, 2 mantissa (activations/gradients)
+ * INT8: 8-bit integer quantization
+ * INT4/NF4: 4-bit quantization (weights only)
+ */
+export type PrecisionType = 
+  | 'fp32' 
+  | 'fp16' 
+  | 'bf16' 
+  | 'fp8_e4m3' 
+  | 'fp8_e5m2' 
+  | 'int8' 
+  | 'int4' 
+  | 'nf4';
+
+/**
+ * Quantization configuration for training/inference
+ */
+export interface QuantizationConfig {
+  // Weight quantization
+  weightPrecision: PrecisionType;
+  
+  // Activation quantization (inference)
+  activationPrecision: PrecisionType;
+  
+  // KV cache quantization (inference)
+  kvCachePrecision: PrecisionType;
+  
+  // Gradient precision (training)
+  gradientPrecision?: PrecisionType;
+  
+  // Quantization method (for INT4/INT8)
+  method?: 'ptq' | 'qat' | 'gptq' | 'awq' | 'qlora';
+  
+  // Group size for block-wise quantization
+  groupSize?: number;
+}
+
+/**
+ * Get bytes per element for a given precision
+ */
+export function getPrecisionBytes(precision: PrecisionType): number {
+  switch (precision) {
+    case 'fp32': return 4;
+    case 'fp16': return 2;
+    case 'bf16': return 2;
+    case 'fp8_e4m3': return 1;
+    case 'fp8_e5m2': return 1;
+    case 'int8': return 1;
+    case 'int4': return 0.5;
+    case 'nf4': return 0.5;
+    default: return 2; // Default to FP16
+  }
+}
+
+/**
+ * Get compute throughput multiplier compared to FP16
+ * Higher = faster
+ */
+export function getPrecisionThroughputMultiplier(precision: PrecisionType): number {
+  switch (precision) {
+    case 'fp32': return 0.5;  // 2x slower than FP16
+    case 'fp16': return 1.0;
+    case 'bf16': return 1.0;
+    case 'fp8_e4m3': return 2.0;  // 2x faster on Hopper
+    case 'fp8_e5m2': return 2.0;
+    case 'int8': return 2.0;
+    case 'int4': return 2.5;  // Limited by dequantization overhead
+    case 'nf4': return 2.0;
+    default: return 1.0;
+  }
+}
+
 export interface ModelConfig {
   name: string;
   // 基础参数
