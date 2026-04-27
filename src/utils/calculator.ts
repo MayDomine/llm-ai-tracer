@@ -46,7 +46,10 @@ export function calculateModelParameters(modelConfig: ModelConfig): {
     intermediateSize: d_ff,
     ffnType,
     numExperts,
-    sharedExpertNum
+    sharedExpertNum,
+    denseIntermediateSize,
+    sharedExpertIntermediateSize,
+    numDenseLayers: configuredDenseLayers,
   } = modelConfig;
 
   // Embedding: vocab_size × hidden_size
@@ -58,29 +61,32 @@ export function calculateModelParameters(modelConfig: ModelConfig): {
   const attentionPerLayer = d * d + d * d_kv + d * d_kv + d * d; // Q + K + V + O
   const attention = attentionPerLayer * L;
 
+  const totalDenseLayers = Math.max(0, Math.min(L, configuredDenseLayers ?? 0));
+  const totalMoeLayers = Math.max(0, L - totalDenseLayers);
+  const denseDff = denseIntermediateSize ?? d_ff;
+  const totalSharedIntermediate = sharedExpertIntermediateSize ?? ((sharedExpertNum || 0) * d_ff);
+
   // FFN per layer
-  let ffnPerLayer: number;
+  let ffn: number;
   if (ffnType === 'gpt') {
     // GPT-style: up (d × d_ff) + down (d_ff × d)
-    ffnPerLayer = 2 * d * d_ff;
+    ffn = L * 2 * d * d_ff;
   } else if (ffnType === 'gated') {
     // LLaMA-style: gate (d × d_ff) + up (d × d_ff) + down (d_ff × d)
-    ffnPerLayer = 3 * d * d_ff;
+    ffn = L * 3 * d * d_ff;
   } else if (ffnType === 'moe') {
-    // MoE: router + experts
+    // MoE: dense prefix/suffix layers + routed experts + shared experts
     const nExperts = numExperts || 8;
-    const sharedExperts = sharedExpertNum || 0;
-    // Router: d × num_experts
+    const denseFfnPerLayer = 3 * d * denseDff;
     const router = d * nExperts;
     // Each expert: 3 × d × d_ff (gated)
     const expertsParams = nExperts * 3 * d * d_ff;
-    // Shared experts
-    const sharedParams = sharedExperts * 3 * d * d_ff;
-    ffnPerLayer = router + expertsParams + sharedParams;
+    const sharedParams = 3 * d * totalSharedIntermediate;
+    const moeFfnPerLayer = router + expertsParams + sharedParams;
+    ffn = totalDenseLayers * denseFfnPerLayer + totalMoeLayers * moeFfnPerLayer;
   } else {
-    ffnPerLayer = 2 * d * d_ff;
+    ffn = L * 2 * d * d_ff;
   }
-  const ffn = ffnPerLayer * L;
 
   // LM Head: hidden_size × vocab_size (often tied with embedding)
   const lmHead = d * V;
@@ -100,6 +106,192 @@ export function calculateModelParameters(modelConfig: ModelConfig): {
     layerNorm,
     total
   };
+}
+
+function getTrainingGatedLinearMultiplier(modelConfig: ModelConfig): number {
+  return modelConfig.ffnType === 'gpt' ? 1 : 1.5;
+}
+
+function getMoELayerCounts(modelConfig: ModelConfig): { numDenseLayers: number; numMoeLayers: number } {
+  if (modelConfig.ffnType !== 'moe') {
+    return { numDenseLayers: modelConfig.numLayers, numMoeLayers: 0 };
+  }
+
+  const numDenseLayers = Math.max(
+    0,
+    Math.min(modelConfig.numLayers, modelConfig.numDenseLayers ?? 0)
+  );
+
+  return {
+    numDenseLayers,
+    numMoeLayers: modelConfig.numLayers - numDenseLayers,
+  };
+}
+
+function getMoEIntermediateSizes(modelConfig: ModelConfig): {
+  denseIntermediateSize: number;
+  moeIntermediateSize: number;
+  sharedExpertIntermediateSize: number;
+} {
+  const moeIntermediateSize = modelConfig.intermediateSize;
+  return {
+    denseIntermediateSize: modelConfig.denseIntermediateSize ?? moeIntermediateSize,
+    moeIntermediateSize,
+    sharedExpertIntermediateSize:
+      modelConfig.sharedExpertIntermediateSize
+      ?? ((modelConfig.sharedExpertNum ?? 0) * moeIntermediateSize),
+  };
+}
+
+export interface TrainingParameterCounts {
+  totalParameters: number;
+  activeParameters: number;
+  totalTransformerParameters: number;
+  activeTransformerParameters: number;
+  vocabParameters: number;
+  numDenseLayers: number;
+  numMoeLayers: number;
+}
+
+/**
+ * Estimate training-active parameter counts using a Megatron-style MoE view:
+ * routed experts contribute by top-k to active params, while total params still
+ * include every expert for optimizer/state memory.
+ */
+export function calculateTrainingParameterCounts(modelConfig: ModelConfig): TrainingParameterCounts {
+  const {
+    hiddenSize: d,
+    vocabSize: V,
+    numKVHeads: h_kv,
+    headDim: d_h,
+    numExperts,
+  } = modelConfig;
+
+  const d_kv = h_kv * d_h;
+  const attnParamsPerLayer = d * d + d * d_kv + d * d_kv + d * d;
+  const gatedLinearMultiplier = getTrainingGatedLinearMultiplier(modelConfig);
+  const { numDenseLayers, numMoeLayers } = getMoELayerCounts(modelConfig);
+  const {
+    denseIntermediateSize,
+    moeIntermediateSize,
+    sharedExpertIntermediateSize,
+  } = getMoEIntermediateSizes(modelConfig);
+
+  const denseMlpParamsPerLayer = 2 * d * denseIntermediateSize * gatedLinearMultiplier;
+
+  if (modelConfig.ffnType !== 'moe') {
+    const totalTransformerParameters =
+      modelConfig.numLayers * (attnParamsPerLayer + denseMlpParamsPerLayer);
+    const vocabParameters = d * V;
+    return {
+      totalParameters: totalTransformerParameters + vocabParameters,
+      activeParameters: totalTransformerParameters + vocabParameters,
+      totalTransformerParameters,
+      activeTransformerParameters: totalTransformerParameters,
+      vocabParameters,
+      numDenseLayers: modelConfig.numLayers,
+      numMoeLayers: 0,
+    };
+  }
+
+  const nExperts = numExperts || 8;
+  const topK = modelConfig.numExpertsPerToken || 2;
+  const routerParamsPerLayer = d * nExperts;
+  const moeTotalMlpParamsPerLayer =
+    routerParamsPerLayer
+    + (2 * d * moeIntermediateSize * gatedLinearMultiplier * nExperts)
+    + (2 * d * sharedExpertIntermediateSize * gatedLinearMultiplier);
+  const moeActiveMlpParamsPerLayer =
+    routerParamsPerLayer
+    + (2 * d * moeIntermediateSize * gatedLinearMultiplier * topK)
+    + (2 * d * sharedExpertIntermediateSize * gatedLinearMultiplier);
+
+  const totalTransformerParameters =
+    numDenseLayers * (attnParamsPerLayer + denseMlpParamsPerLayer)
+    + numMoeLayers * (attnParamsPerLayer + moeTotalMlpParamsPerLayer);
+  const activeTransformerParameters =
+    numDenseLayers * (attnParamsPerLayer + denseMlpParamsPerLayer)
+    + numMoeLayers * (attnParamsPerLayer + moeActiveMlpParamsPerLayer);
+  const vocabParameters = d * V;
+
+  return {
+    totalParameters: totalTransformerParameters + vocabParameters,
+    activeParameters: activeTransformerParameters + vocabParameters,
+    totalTransformerParameters,
+    activeTransformerParameters,
+    vocabParameters,
+    numDenseLayers,
+    numMoeLayers,
+  };
+}
+
+/**
+ * Estimate training FLOPs for a batch with a Megatron-style Transformer/MoE formula.
+ *
+ * This follows the same structure as Megatron's `num_floating_point_operations()`
+ * for standard Transformer + MoE training, so routed experts contribute by top-k
+ * rather than by total expert count.
+ */
+export function estimateTrainingFlops(
+  modelConfig: ModelConfig,
+  batchSize: number,
+  seqLength: number
+): number {
+  const {
+    hiddenSize: h,
+    vocabSize: v,
+    numAttentionHeads,
+    numKVHeads,
+    headDim,
+  } = modelConfig;
+
+  const { numDenseLayers, numMoeLayers } = getMoELayerCounts(modelConfig);
+  const {
+    denseIntermediateSize,
+    moeIntermediateSize,
+    sharedExpertIntermediateSize,
+  } = getMoEIntermediateSizes(modelConfig);
+  const gatedLinearMultiplier = getTrainingGatedLinearMultiplier(modelConfig);
+  const queryProjectionSize = headDim * numAttentionHeads;
+  const queryProjectionToHiddenSizeRatio = queryProjectionSize / h;
+  const expansionFactor = 12; // 3 * 2 * 2, same as Megatron estimator
+
+  const selfAttentionTerm =
+    expansionFactor
+    * modelConfig.numLayers
+    * h
+    * h
+    * (
+      (
+        1
+        + (numKVHeads / numAttentionHeads)
+        + (seqLength / h / 2)
+      )
+      * queryProjectionToHiddenSizeRatio
+    );
+
+  const denseFeedForwardTerm =
+    numDenseLayers * denseIntermediateSize * gatedLinearMultiplier;
+  const moeFeedForwardTerm =
+    numMoeLayers
+    * (
+      moeIntermediateSize * (modelConfig.numExpertsPerToken || 2) * gatedLinearMultiplier
+      + sharedExpertIntermediateSize * gatedLinearMultiplier
+    );
+
+  const perTokenFlops =
+    expansionFactor * h * (denseFeedForwardTerm + moeFeedForwardTerm)
+    + selfAttentionTerm
+    + 6 * h * v;
+
+  return batchSize * seqLength * perTokenFlops;
+}
+
+export function estimateTrainingFlopsPerToken(
+  modelConfig: ModelConfig,
+  seqLength: number
+): number {
+  return estimateTrainingFlops(modelConfig, 1, seqLength) / seqLength;
 }
 
 /**

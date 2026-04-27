@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -14,6 +14,7 @@ import {
   BarChart3,
   Cpu,
   HelpCircle,
+  Clock,
 } from 'lucide-react';
 import type { ModelConfig, HardwareConfig } from '../types/model';
 import type {
@@ -26,6 +27,7 @@ import {
   analyzeTrainingStep,
   validateParallelism,
   validateBatchConfig,
+  estimateTrainingTime,
   formatBytes,
   formatThroughput,
 } from '../utils/trainingCalculator';
@@ -94,6 +96,8 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
   
   // Expanded sections
   const [expandedSection, setExpandedSection] = useState<string | null>('parallelism');
+  const [estimateMfuPercent, setEstimateMfuPercent] = useState(40);
+  const [estimateTokenBudgetT, setEstimateTokenBudgetT] = useState(1);
 
   // Calculate derived values
   // Note: CP is part of the data parallel dimension (splits sequence, not batch)
@@ -187,6 +191,17 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
       return null;
     }
   }, [modelConfig, trainingConfig, cluster, isValid]);
+
+  const trainingTimeEstimate = useMemo(() => {
+    if (!isValid) return null;
+    return estimateTrainingTime(
+      modelConfig,
+      trainingConfig,
+      cluster,
+      estimateMfuPercent / 100,
+      estimateTokenBudgetT * 1e12
+    );
+  }, [modelConfig, trainingConfig, cluster, isValid, estimateMfuPercent, estimateTokenBudgetT]);
 
   // Available options
   const tpOptions = [1, 2, 4, 8].filter(tp => 
@@ -700,6 +715,79 @@ export function TrainingStrategyPage({ modelConfig, hardwareConfig }: TrainingSt
                 {isValid ? 'Valid' : 'Invalid'}
               </span>
             </div>
+          </div>
+
+          {/* Cost Estimate */}
+          <div className="glass rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2">
+              <Clock className="w-3.5 h-3.5 text-cyan-400" />
+              <h3 className="font-medium text-xs">Cost Estimate</h3>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <CompactMetricInput
+                label="Target MFU"
+                suffix="%"
+                value={estimateMfuPercent}
+                onChange={setEstimateMfuPercent}
+                min={1}
+                max={100}
+              />
+              <CompactMetricInput
+                label="Total Tokens"
+                suffix="T"
+                value={estimateTokenBudgetT}
+                onChange={setEstimateTokenBudgetT}
+                min={0.01}
+              />
+            </div>
+
+            {analysis && (
+              <button
+                onClick={() => setEstimateMfuPercent(Number((analysis.mfu * 100).toFixed(1)))}
+                className="w-full mt-2 px-2 py-1 rounded bg-gray-800/50 text-[10px] text-gray-400 hover:bg-gray-700/50 hover:text-gray-200 transition-colors"
+              >
+                Use predicted MFU {analysis.mfu * 100 < 1 ? (analysis.mfu * 100).toFixed(2) : (analysis.mfu * 100).toFixed(1)}%
+              </button>
+            )}
+
+            {trainingTimeEstimate ? (
+              <>
+                <div className="text-lg font-bold font-mono text-cyan-400 mt-2">
+                  {formatDurationCompact(trainingTimeEstimate.timeSeconds)}
+                </div>
+                <div className="text-[10px] text-gray-500 mt-0.5">
+                  {formatThroughput(trainingTimeEstimate.tokensPerSecond)} tok/s @ {estimateMfuPercent.toFixed(1)}% MFU
+                </div>
+
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 mt-2 text-[10px]">
+                  <div className="flex justify-between gap-2">
+                    <span className="text-gray-500">Steps</span>
+                    <span className="font-mono text-gray-300">{formatCompactValue(trainingTimeEstimate.totalSteps)}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-gray-500">GPU-hours</span>
+                    <span className="font-mono text-gray-300">{formatCompactValue(trainingTimeEstimate.gpuHours)}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-gray-500">Tok/step</span>
+                    <span className="font-mono text-gray-300">{formatCompactValue(trainingTimeEstimate.tokensPerStep)}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-gray-500">Active GPUs</span>
+                    <span className="font-mono text-gray-300">{trainingTimeEstimate.activeGPUs}</span>
+                  </div>
+                </div>
+
+                <div className="text-[10px] text-gray-500 mt-2 pt-2 border-t border-gray-700">
+                  Fixed pretrain length uses current Seq Length = {maxSeqLength}.
+                </div>
+              </>
+            ) : (
+              <div className="text-[10px] text-gray-500 mt-2">
+                Fix configuration errors to estimate training time.
+              </div>
+            )}
           </div>
 
           {analysis && (
@@ -1266,6 +1354,115 @@ function PrecisionBadge({ precision }: { precision: string }) {
 
 // Import TrainingMemoryBreakdown type for the component
 import type { TrainingMemoryBreakdown } from '../types/training';
+
+function formatDurationCompact(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${minutes.toFixed(1)} min`;
+
+  const hours = minutes / 60;
+  if (hours < 24) return `${hours.toFixed(1)} h`;
+
+  const days = hours / 24;
+  if (days < 30) return `${days.toFixed(1)} d`;
+  if (days < 365) return `${(days / 30).toFixed(1)} mo`;
+  return `${(days / 365).toFixed(1)} y`;
+}
+
+function formatCompactValue(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 1e12) return `${(value / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  if (abs >= 100) return value.toFixed(0);
+  if (abs >= 10) return value.toFixed(1);
+  return value.toFixed(2);
+}
+
+function CompactMetricInput({
+  label,
+  suffix,
+  value,
+  onChange,
+  min,
+  max,
+}: {
+  label: string;
+  suffix?: string;
+  value: number;
+  onChange: (value: number) => void;
+  min?: number;
+  max?: number;
+}) {
+  const [inputValue, setInputValue] = useState(value.toString());
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setInputValue(value.toString());
+  }, [value]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const nextValue = e.target.value;
+    setInputValue(nextValue);
+
+    if (nextValue.trim() === '') {
+      setError('Required');
+      return;
+    }
+
+    const num = Number(nextValue);
+    if (!Number.isFinite(num)) {
+      setError('Must be a number');
+      return;
+    }
+
+    if (min !== undefined && num < min) {
+      setError(`>= ${min}`);
+      return;
+    }
+
+    if (max !== undefined && num > max) {
+      setError(`<= ${max}`);
+      return;
+    }
+
+    setError(null);
+    onChange(num);
+  };
+
+  const handleBlur = () => {
+    if (error) {
+      setInputValue(value.toString());
+      setError(null);
+    }
+  };
+
+  return (
+    <div>
+      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+      <div className="relative">
+        <input
+          type="text"
+          value={inputValue}
+          onChange={handleChange}
+          onBlur={handleBlur}
+          className={`w-full px-2 py-1.5 pr-7 text-xs bg-gray-800 rounded-lg border transition-colors font-mono ${
+            error
+              ? 'border-red-500 border-dashed focus:border-red-400'
+              : 'border-gray-700 focus:border-cyan-500'
+          } focus:outline-none`}
+        />
+        {suffix && (
+          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
+            {suffix}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // Reusable number input component with validation
 function NumberInput({

@@ -105,6 +105,9 @@ export interface ModelConfig {
   numExperts?: number;          // 专家数量
   numExpertsPerToken?: number;  // 每个token激活的专家数
   sharedExpertNum?: number;     // 共享专家数量 (Qwen3 MoE)
+  denseIntermediateSize?: number;         // dense layers 的 FFN intermediate size
+  sharedExpertIntermediateSize?: number;  // 所有 shared experts 的总 intermediate size
+  numDenseLayers?: number;                // dense FFN layers count before/among MoE layers
   
   // 序列参数
   maxSeqLen: number;            // 最大序列长度

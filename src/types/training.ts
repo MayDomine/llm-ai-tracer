@@ -35,6 +35,10 @@ export interface CalculatorAssumptions {
   // Actual kernel performance vs theoretical peak
   // Range: 0.6-0.8 for well-optimized kernels
   kernelEfficiency: number;
+
+  // Achieved HBM bandwidth vs theoretical peak
+  // Range: 0.75-0.95 depending on kernel mix and fusion quality
+  memoryBandwidthEfficiency: number;
   
   // Activation memory factor (simplified calculation path)
   // Real value depends on: FlashAttention, sequence parallel, model architecture
@@ -56,6 +60,7 @@ export const DEFAULT_CALCULATOR_ASSUMPTIONS: CalculatorAssumptions = {
   frameworkOverheadMinBytes: 500 * 1024 * 1024, // 500MB minimum
   ncclOverheadFactor: 1.1,                  // 10% overhead
   kernelEfficiency: 0.7,                    // 70% of theoretical peak
+  memoryBandwidthEfficiency: 0.85,          // Typical achieved HBM bandwidth
   activationFactor: 12,                     // Conservative with FlashAttention
   recomputationFullOverhead: 0.33,
   recomputationSelectiveOverhead: 0.05,

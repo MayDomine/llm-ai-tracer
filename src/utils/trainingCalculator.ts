@@ -5,8 +5,8 @@
  * Implements formulas from Megatron-LM, ZeRO, and related research.
  * 
  * Formula References:
- * - Forward FLOPs ≈ 2N×T (OpenAI Scaling Laws, Kaplan et al., 2020)
- * - Backward FLOPs ≈ 2× Forward (Megatron-LM, NVIDIA)
+ * - Transformer training FLOPs use a Megatron-style decomposition with
+ *   attention, FFN/MoE, and vocab terms instead of a raw 6N shortcut
  * - Ring AllReduce: 2×(n-1)/n × data/BW (NCCL)
  * - Pipeline Bubble: (PP-1)/microbatches (GPipe, Huang et al., 2019)
  * - ZeRO Memory Formulas (Rajbhandari et al., 2020)
@@ -26,7 +26,11 @@ import type {
   NetworkLatencyConfig,
 } from '../types/training';
 import { DEFAULT_CALCULATOR_ASSUMPTIONS, DEFAULT_NETWORK_LATENCY } from '../types/training';
-import { calculateModelParameters } from './calculator';
+import {
+  calculateModelParameters,
+  estimateTrainingFlops,
+  estimateTrainingFlopsPerToken,
+} from './calculator';
 // Unified activation calculator is available for detailed calculations:
 // import { calculatePerLayerActivations, calculateLMHeadLogitsMemory } from './activationCalculator';
 
@@ -842,8 +846,9 @@ export function calculateTrainingMemory(
  * Citation: NCCL documentation, LogP model (Culler et al., 1993)
  */
 interface CommTimeParams {
-  dataBytes: number;
+  tensorBytes: number;
   numRanks: number;
+  numCalls?: number;
   bandwidthGBs: number;
   latencyUs?: number;      // Per-hop latency in microseconds
   numHops?: number;        // Number of network hops
@@ -857,15 +862,23 @@ interface CommTimeParams {
  * Citation: NCCL documentation
  */
 function ringAllReduceTime(params: CommTimeParams): number {
-  const { dataBytes, numRanks, bandwidthGBs, latencyUs = 0, numHops = 1, ncclOverhead = 1.1 } = params;
-  if (numRanks <= 1) return 0;
+  const {
+    tensorBytes,
+    numRanks,
+    numCalls = 1,
+    bandwidthGBs,
+    latencyUs = 0,
+    numHops = 1,
+    ncclOverhead = 1.1,
+  } = params;
+  if (numRanks <= 1 || tensorBytes <= 0 || numCalls <= 0) return 0;
   
-  // Bandwidth component: reduce-scatter + all-gather
-  const factor = 2 * (numRanks - 1) / numRanks;
-  const bandwidthTimeMs = (dataBytes * factor) / (bandwidthGBs * 1e9) * 1000;
+  const ringSteps = numRanks - 1;
+  const factor = 2 * ringSteps / numRanks;
+  const bandwidthTimeMs = numCalls * (tensorBytes * factor) / (bandwidthGBs * 1e9) * 1000;
   
-  // Latency component: 2 phases × hops
-  const latencyTimeMs = (latencyUs * numHops * 2) / 1000;
+  // Ring all-reduce has 2*(n-1) startup steps.
+  const latencyTimeMs = numCalls * (latencyUs * numHops * 2 * ringSteps) / 1000;
   
   return (bandwidthTimeMs + latencyTimeMs) * ncclOverhead;
 }
@@ -874,24 +887,47 @@ function ringAllReduceTime(params: CommTimeParams): number {
  * Calculate AllGather time with latency
  */
 function allGatherTime(params: CommTimeParams): number {
-  const { dataBytes, numRanks, bandwidthGBs, latencyUs = 0, numHops = 1, ncclOverhead = 1.1 } = params;
-  if (numRanks <= 1) return 0;
+  const {
+    tensorBytes,
+    numRanks,
+    numCalls = 1,
+    bandwidthGBs,
+    latencyUs = 0,
+    numHops = 1,
+    ncclOverhead = 1.1,
+  } = params;
+  if (numRanks <= 1 || tensorBytes <= 0 || numCalls <= 0) return 0;
   
-  const factor = (numRanks - 1) / numRanks;
-  const bandwidthTimeMs = (dataBytes * factor) / (bandwidthGBs * 1e9) * 1000;
-  const latencyTimeMs = (latencyUs * numHops) / 1000;
+  const ringSteps = numRanks - 1;
+  const factor = ringSteps / numRanks;
+  const bandwidthTimeMs = numCalls * (tensorBytes * factor) / (bandwidthGBs * 1e9) * 1000;
+  const latencyTimeMs = numCalls * (latencyUs * numHops * ringSteps) / 1000;
   
   return (bandwidthTimeMs + latencyTimeMs) * ncclOverhead;
+}
+
+/**
+ * Calculate ReduceScatter time with latency
+ */
+function reduceScatterTime(params: CommTimeParams): number {
+  return allGatherTime(params);
 }
 
 /**
  * Calculate P2P time with latency
  */
 function p2pTime(params: CommTimeParams): number {
-  const { dataBytes, bandwidthGBs, latencyUs = 0, numHops = 1 } = params;
+  const {
+    tensorBytes,
+    numCalls = 1,
+    bandwidthGBs,
+    latencyUs = 0,
+    numHops = 1,
+  } = params;
+  if (tensorBytes <= 0 || numCalls <= 0) return 0;
   
-  const bandwidthTimeMs = dataBytes / (bandwidthGBs * 1e9) * 1000;
-  const latencyTimeMs = (latencyUs * numHops) / 1000;
+  const bandwidthTimeMs = numCalls * tensorBytes / (bandwidthGBs * 1e9) * 1000;
+  const latencyTimeMs = numCalls * (latencyUs * numHops) / 1000;
   
   return bandwidthTimeMs + latencyTimeMs;
 }
@@ -903,17 +939,339 @@ function p2pTime(params: CommTimeParams): number {
  * Citation: DeepSpeed Ulysses paper
  */
 function allToAllTime(params: CommTimeParams): number {
-  const { dataBytes, numRanks, bandwidthGBs, latencyUs = 0, numHops = 1, ncclOverhead = 1.1 } = params;
-  if (numRanks <= 1) return 0;
+  const {
+    tensorBytes,
+    numRanks,
+    numCalls = 1,
+    bandwidthGBs,
+    latencyUs = 0,
+    numHops = 1,
+    ncclOverhead = 1.1,
+  } = params;
+  if (numRanks <= 1 || tensorBytes <= 0 || numCalls <= 0) return 0;
   
-  // Each rank sends (P-1)/P of its data
-  const factor = (numRanks - 1) / numRanks;
-  const bandwidthTimeMs = (dataBytes * factor) / (bandwidthGBs * 1e9) * 1000;
+  const pairwiseSteps = numRanks - 1;
+  const factor = pairwiseSteps / numRanks;
+  const bandwidthTimeMs = numCalls * (tensorBytes * factor) / (bandwidthGBs * 1e9) * 1000;
   
-  // All-to-All has higher latency due to many concurrent messages
-  const latencyTimeMs = (latencyUs * numHops * (numRanks - 1)) / 1000;
+  const latencyTimeMs = numCalls * (latencyUs * numHops * pairwiseSteps) / 1000;
   
   return (bandwidthTimeMs + latencyTimeMs) * ncclOverhead;
+}
+
+interface LocalShardedParameterCounts {
+  attention: number;
+  ffn: number;
+  embedding: number;
+  lmHead: number;
+  layerNorm: number;
+  total: number;
+  transformerOnly: number;
+}
+
+interface TrainingMemoryTraffic {
+  forwardBytes: number;
+  backwardBytes: number;
+}
+
+function getMoELayerCounts(model: ModelConfig): { numDenseLayers: number; numMoeLayers: number } {
+  if (model.ffnType !== 'moe') {
+    return { numDenseLayers: model.numLayers, numMoeLayers: 0 };
+  }
+
+  const numDenseLayers = Math.max(0, Math.min(model.numLayers, model.numDenseLayers ?? 0));
+  return {
+    numDenseLayers,
+    numMoeLayers: model.numLayers - numDenseLayers,
+  };
+}
+
+function getDenseIntermediateSize(model: ModelConfig): number {
+  return model.denseIntermediateSize ?? model.intermediateSize;
+}
+
+function getSharedExpertIntermediateSize(model: ModelConfig): number {
+  return model.sharedExpertIntermediateSize
+    ?? ((model.sharedExpertNum ?? 0) * model.intermediateSize);
+}
+
+function getLocalShardedParameterCounts(
+  model: ModelConfig,
+  parallelism: ParallelismConfig
+): LocalShardedParameterCounts {
+  const params = calculateModelParameters(model);
+  const ffnShardDegree = model.ffnType === 'moe'
+    ? parallelism.expertParallel
+    : parallelism.tensorParallel;
+
+  const attention = params.attention / (parallelism.tensorParallel * parallelism.pipelineParallel);
+  const ffn = params.ffn / (ffnShardDegree * parallelism.pipelineParallel);
+  const embedding = params.embedding / parallelism.pipelineParallel;
+  const lmHead = params.lmHead / (parallelism.tensorParallel * parallelism.pipelineParallel);
+  const layerNorm = params.layerNorm / parallelism.pipelineParallel;
+
+  return {
+    attention,
+    ffn,
+    embedding,
+    lmHead,
+    layerNorm,
+    total: attention + ffn + embedding + lmHead + layerNorm,
+    transformerOnly: attention + ffn + layerNorm,
+  };
+}
+
+function zeroTraffic(): TrainingMemoryTraffic {
+  return { forwardBytes: 0, backwardBytes: 0 };
+}
+
+function addTraffic(...items: TrainingMemoryTraffic[]): TrainingMemoryTraffic {
+  return items.reduce(
+    (sum, item) => ({
+      forwardBytes: sum.forwardBytes + item.forwardBytes,
+      backwardBytes: sum.backwardBytes + item.backwardBytes,
+    }),
+    zeroTraffic()
+  );
+}
+
+function scaleTraffic(traffic: TrainingMemoryTraffic, factor: number): TrainingMemoryTraffic {
+  return {
+    forwardBytes: traffic.forwardBytes * factor,
+    backwardBytes: traffic.backwardBytes * factor,
+  };
+}
+
+function linearTrainingTraffic(
+  tokenCount: number,
+  inputDim: number,
+  outputDim: number,
+  elemBytes: number
+): TrainingMemoryTraffic {
+  const inputBytes = tokenCount * inputDim * elemBytes;
+  const weightBytes = inputDim * outputDim * elemBytes;
+  const outputBytes = tokenCount * outputDim * elemBytes;
+  const forwardBytes = inputBytes + weightBytes + outputBytes;
+
+  return {
+    forwardBytes,
+    backwardBytes: 2 * forwardBytes,
+  };
+}
+
+function layerNormTrainingTraffic(elements: number, elemBytes: number): TrainingMemoryTraffic {
+  const tensorBytes = elements * elemBytes;
+  return {
+    forwardBytes: 3 * tensorBytes,
+    backwardBytes: 4 * tensorBytes,
+  };
+}
+
+function residualTrainingTraffic(elements: number, elemBytes: number): TrainingMemoryTraffic {
+  const tensorBytes = elements * elemBytes;
+  return {
+    forwardBytes: 3 * tensorBytes,
+    backwardBytes: 3 * tensorBytes,
+  };
+}
+
+function unaryActivationTrainingTraffic(elements: number, elemBytes: number): TrainingMemoryTraffic {
+  const tensorBytes = elements * elemBytes;
+  return {
+    forwardBytes: 2 * tensorBytes,
+    backwardBytes: 3 * tensorBytes,
+  };
+}
+
+function multiplyTrainingTraffic(elements: number, elemBytes: number): TrainingMemoryTraffic {
+  const tensorBytes = elements * elemBytes;
+  return {
+    forwardBytes: 3 * tensorBytes,
+    backwardBytes: 4 * tensorBytes,
+  };
+}
+
+function softmaxTrainingTraffic(elements: number, elemBytes: number): TrainingMemoryTraffic {
+  const tensorBytes = elements * elemBytes;
+  return {
+    forwardBytes: 2 * tensorBytes,
+    backwardBytes: 3 * tensorBytes,
+  };
+}
+
+function flashAttentionTrainingTraffic(
+  tokenCount: number,
+  localQueryDim: number,
+  localKvDim: number,
+  localHeads: number,
+  elemBytes: number
+): TrainingMemoryTraffic {
+  const qBytes = tokenCount * localQueryDim * elemBytes;
+  const kBytes = tokenCount * localKvDim * elemBytes;
+  const vBytes = tokenCount * localKvDim * elemBytes;
+  const oBytes = tokenCount * localQueryDim * elemBytes;
+  const statsBytes = tokenCount * localHeads * 4; // FP32 softmax stats
+
+  return {
+    forwardBytes: qBytes + kBytes + vBytes + oBytes + statsBytes,
+    backwardBytes: 2 * (qBytes + kBytes + vBytes + oBytes) + statsBytes,
+  };
+}
+
+function naiveAttentionTrainingTraffic(
+  batchSize: number,
+  seqLenPerRank: number,
+  localHeads: number,
+  tokenCount: number,
+  localQueryDim: number,
+  localKvDim: number,
+  elemBytes: number
+): TrainingMemoryTraffic {
+  const qBytes = tokenCount * localQueryDim * elemBytes;
+  const kBytes = tokenCount * localKvDim * elemBytes;
+  const vBytes = tokenCount * localKvDim * elemBytes;
+  const oBytes = tokenCount * localQueryDim * elemBytes;
+  const scoreBytes = batchSize * localHeads * seqLenPerRank * seqLenPerRank * elemBytes;
+
+  return {
+    forwardBytes: qBytes + kBytes + vBytes + oBytes + 4 * scoreBytes,
+    backwardBytes: 2 * (qBytes + kBytes + vBytes + oBytes) + 6 * scoreBytes,
+  };
+}
+
+function estimateTrainingMemoryTraffic(
+  model: ModelConfig,
+  config: TrainingConfig
+): TrainingMemoryTraffic {
+  const { batch, parallelism, memoryOptimization } = config;
+  const {
+    tensorParallel,
+    pipelineParallel,
+    expertParallel,
+    contextParallel,
+    sequenceParallel,
+  } = parallelism;
+  const elemBytes = getPrecisionBytes(config.mixedPrecision);
+  const seqLenPerRank = Math.ceil(config.maxSeqLength / contextParallel);
+  const tokenCount = batch.microBatchSize * seqLenPerRank;
+  const normTokenCount = sequenceParallel && tensorParallel > 1
+    ? tokenCount / tensorParallel
+    : tokenCount;
+  const normElements = normTokenCount * model.hiddenSize;
+  const localQueryDim = model.hiddenSize / tensorParallel;
+  const localKvDim = (model.numKVHeads * model.headDim) / tensorParallel;
+  const localHeads = model.numAttentionHeads / tensorParallel;
+  const { numDenseLayers, numMoeLayers } = getMoELayerCounts(model);
+  const denseLayersPerStage = numDenseLayers / pipelineParallel;
+  const moeLayersPerStage = numMoeLayers / pipelineParallel;
+  const denseIntermediate = getDenseIntermediateSize(model);
+  const localDenseIntermediate = denseIntermediate / tensorParallel;
+  const layerNormTraffic = layerNormTrainingTraffic(normElements, elemBytes);
+  const residualTraffic = residualTrainingTraffic(normElements, elemBytes);
+  const attentionCoreTraffic = memoryOptimization.flashAttention
+    ? flashAttentionTrainingTraffic(
+        tokenCount,
+        localQueryDim,
+        localKvDim,
+        localHeads,
+        elemBytes
+      )
+    : naiveAttentionTrainingTraffic(
+        batch.microBatchSize,
+        seqLenPerRank,
+        localHeads,
+        tokenCount,
+        localQueryDim,
+        localKvDim,
+        elemBytes
+      );
+
+  const denseFfnTraffic = model.ffnType === 'gpt'
+    ? addTraffic(
+        linearTrainingTraffic(tokenCount, model.hiddenSize, localDenseIntermediate, elemBytes),
+        unaryActivationTrainingTraffic(tokenCount * localDenseIntermediate, elemBytes),
+        linearTrainingTraffic(tokenCount, localDenseIntermediate, model.hiddenSize, elemBytes)
+      )
+    : addTraffic(
+        linearTrainingTraffic(tokenCount, model.hiddenSize, localDenseIntermediate, elemBytes),
+        linearTrainingTraffic(tokenCount, model.hiddenSize, localDenseIntermediate, elemBytes),
+        unaryActivationTrainingTraffic(tokenCount * localDenseIntermediate, elemBytes),
+        multiplyTrainingTraffic(tokenCount * localDenseIntermediate, elemBytes),
+        linearTrainingTraffic(tokenCount, localDenseIntermediate, model.hiddenSize, elemBytes)
+      );
+
+  const denseLayerTraffic = addTraffic(
+    layerNormTraffic,
+    linearTrainingTraffic(tokenCount, model.hiddenSize, localQueryDim, elemBytes),
+    linearTrainingTraffic(tokenCount, model.hiddenSize, localKvDim, elemBytes),
+    linearTrainingTraffic(tokenCount, model.hiddenSize, localKvDim, elemBytes),
+    attentionCoreTraffic,
+    linearTrainingTraffic(tokenCount, localQueryDim, model.hiddenSize, elemBytes),
+    residualTraffic,
+    layerNormTraffic,
+    denseFfnTraffic,
+    residualTraffic
+  );
+
+  let moeLayerTraffic = zeroTraffic();
+  if (moeLayersPerStage > 0) {
+    const nExperts = model.numExperts || 8;
+    const topK = model.numExpertsPerToken || 2;
+    const routedTokenCopiesPerRank = (tokenCount * topK) / expertParallel;
+    const routedIntermediateElements = routedTokenCopiesPerRank * model.intermediateSize;
+    const sharedIntermediate = getSharedExpertIntermediateSize(model);
+    const sharedIntermediateElements = tokenCount * sharedIntermediate;
+
+    const routerTraffic = addTraffic(
+      linearTrainingTraffic(tokenCount, model.hiddenSize, nExperts, elemBytes),
+      softmaxTrainingTraffic(tokenCount * nExperts, elemBytes)
+    );
+
+    const routedExpertTraffic = addTraffic(
+      linearTrainingTraffic(routedTokenCopiesPerRank, model.hiddenSize, model.intermediateSize, elemBytes),
+      linearTrainingTraffic(routedTokenCopiesPerRank, model.hiddenSize, model.intermediateSize, elemBytes),
+      unaryActivationTrainingTraffic(routedIntermediateElements, elemBytes),
+      multiplyTrainingTraffic(routedIntermediateElements, elemBytes),
+      linearTrainingTraffic(routedTokenCopiesPerRank, model.intermediateSize, model.hiddenSize, elemBytes)
+    );
+
+    const sharedExpertTraffic = sharedIntermediate > 0
+      ? addTraffic(
+          linearTrainingTraffic(tokenCount, model.hiddenSize, sharedIntermediate, elemBytes),
+          linearTrainingTraffic(tokenCount, model.hiddenSize, sharedIntermediate, elemBytes),
+          unaryActivationTrainingTraffic(sharedIntermediateElements, elemBytes),
+          multiplyTrainingTraffic(sharedIntermediateElements, elemBytes),
+          linearTrainingTraffic(tokenCount, sharedIntermediate, model.hiddenSize, elemBytes)
+        )
+      : zeroTraffic();
+
+    moeLayerTraffic = addTraffic(
+      layerNormTraffic,
+      linearTrainingTraffic(tokenCount, model.hiddenSize, localQueryDim, elemBytes),
+      linearTrainingTraffic(tokenCount, model.hiddenSize, localKvDim, elemBytes),
+      linearTrainingTraffic(tokenCount, model.hiddenSize, localKvDim, elemBytes),
+      attentionCoreTraffic,
+      linearTrainingTraffic(tokenCount, localQueryDim, model.hiddenSize, elemBytes),
+      residualTraffic,
+      layerNormTraffic,
+      routerTraffic,
+      routedExpertTraffic,
+      sharedExpertTraffic,
+      residualTraffic
+    );
+  }
+
+  const lmHeadTraffic = addTraffic(
+    layerNormTraffic,
+    linearTrainingTraffic(tokenCount, model.hiddenSize, model.vocabSize / tensorParallel, elemBytes),
+    softmaxTrainingTraffic(tokenCount * (model.vocabSize / tensorParallel), elemBytes)
+  );
+
+  return addTraffic(
+    scaleTraffic(denseLayerTraffic, denseLayersPerStage),
+    scaleTraffic(moeLayerTraffic, moeLayersPerStage),
+    scaleTraffic(lmHeadTraffic, 1 / pipelineParallel)
+  );
 }
 
 
@@ -925,135 +1283,108 @@ export function calculateCommunication(
   config: TrainingConfig,
   cluster: ClusterTopology
 ): CommunicationBreakdown {
-  const params = calculateModelParameters(model);
   const { parallelism, batch } = config;
-  const { dataParallel, tensorParallel, pipelineParallel, expertParallel, 
-          contextParallel, contextParallelType, zeroStage, effectiveDataParallel } = parallelism;
-  const bytes = getPrecisionBytes(config.gradientPrecision);
+  const {
+    dataParallel,
+    tensorParallel,
+    pipelineParallel,
+    expertParallel,
+    contextParallel,
+    contextParallelType,
+    zeroStage,
+    effectiveDataParallel,
+  } = parallelism;
+  const gradientElemBytes = getPrecisionBytes(config.gradientPrecision);
+  const activationElemBytes = getPrecisionBytes(config.mixedPrecision);
+  const localParamCounts = getLocalShardedParameterCounts(model, parallelism);
+  const { numMoeLayers } = getMoELayerCounts(model);
   
   // Effective DP for gradient sync and ZeRO sharding = DP × CP
   // CP is a special form of DP that splits sequence instead of batch
   // The gradient AllReduce must happen across ALL data parallel ranks (DP × CP)
   const dpForGradSync = effectiveDataParallel || (dataParallel * contextParallel);
-  
-  // Effective parameters per DP rank (after TP/PP sharding)
-  const paramsPerRank = params.total / (tensorParallel * pipelineParallel);
-  
-  // Effective sequence length per GPU with Context Parallel
-  const seqLenPerGPU = config.maxSeqLength / contextParallel;
-  
-  // Data Parallel communication (gradient sync across DP × CP ranks)
-  // Even with CP, gradients must be synchronized because each CP rank
-  // processes different sequence chunks but needs the same model update
-  //
-  // ZeRO-2 with Gradient Accumulation (GA):
-  // To avoid keeping full gradient buffer (which degrades to ZeRO-1 memory),
-  // Megatron-LM/DeepSpeed perform ReduceScatter EVERY micro-batch.
-  // This increases communication but maintains ZeRO-2 memory benefits.
-  // Reference: DeepSpeed ZeRO-2 implementation, Megatron-LM distributed optimizer
+
+  const seqLenPerGPU = Math.ceil(config.maxSeqLength / contextParallel);
+  const activationTensorBytes =
+    batch.microBatchSize * seqLenPerGPU * model.hiddenSize * activationElemBytes;
+  const localGradientTensorBytes = localParamCounts.total * gradientElemBytes;
+  const localParameterTensorBytes = localParamCounts.total * activationElemBytes;
+  const localTransformerGradientBytes = localParamCounts.transformerOnly * gradientElemBytes;
+  const localTransformerParameterBytes = localParamCounts.transformerOnly * activationElemBytes;
+  const layersPerStage = model.numLayers / pipelineParallel;
+  const perLayerGradientBytes = layersPerStage > 0
+    ? localTransformerGradientBytes / layersPerStage
+    : 0;
+  const perLayerParameterBytes = layersPerStage > 0
+    ? localTransformerParameterBytes / layersPerStage
+    : 0;
+  const numMicrobatches = batch.gradientAccumulation;
+
   let dataParallelVolume = 0;
+  let zeroVolume = 0;
+  let dataParallelTime = 0;
+  let zeroTime = 0;
+
+  // Data-parallel gradient synchronization / ZeRO sharding.
   if (dpForGradSync > 1) {
-    if (zeroStage === 0) {
-      // DDP: AllReduce gradients once per step (after all GA micro-batches)
-      dataParallelVolume = 2 * paramsPerRank * bytes;
-    } else if (zeroStage === 1) {
-      // ZeRO-1: AllReduce gradients once per step
-      dataParallelVolume = 2 * paramsPerRank * bytes;
+    if (zeroStage === 0 || zeroStage === 1) {
+      dataParallelVolume = localGradientTensorBytes;
     } else if (zeroStage === 2) {
-      // ZeRO-2: ReduceScatter + AllGather per MICRO-BATCH
-      // To avoid keeping full gradient buffer, ReduceScatter after each micro-batch
-      // Then AllGather at the end for optimizer step
-      // Volume per micro-batch: ReduceScatter = params/DP (send) + params/DP (recv) = 2*P/DP per micro-batch
-      // At step end: AllGather = 2*P/DP
-      // Total = GA * ReduceScatter + AllGather = GA * 2*P/DP + 2*P/DP = 2*P/DP * (GA + 1)
-      // But simplified: ReduceScatter every micro-batch = 2*P (ring-based) * GA times
-      const reduceScatterPerMicroBatch = 2 * paramsPerRank * bytes / dpForGradSync * (dpForGradSync - 1);
-      const allGatherAtEnd = 2 * paramsPerRank * bytes / dpForGradSync * (dpForGradSync - 1);
-      dataParallelVolume = reduceScatterPerMicroBatch * batch.gradientAccumulation + allGatherAtEnd;
+      dataParallelVolume = localGradientTensorBytes * numMicrobatches;
+      zeroVolume = localParameterTensorBytes;
     } else {
-      // ZeRO-3: AllGather params handled separately in zeroVolume
-      // Gradients: ReduceScatter per micro-batch
-      const reduceScatterPerMicroBatch = 2 * paramsPerRank * bytes / dpForGradSync * (dpForGradSync - 1);
-      dataParallelVolume = reduceScatterPerMicroBatch * batch.gradientAccumulation;
+      const gradCalls = layersPerStage * numMicrobatches;
+      const paramCalls = 2 * layersPerStage * numMicrobatches;
+      dataParallelVolume = perLayerGradientBytes * gradCalls;
+      zeroVolume = perLayerParameterBytes * paramCalls;
     }
   }
-  
-  // ZeRO-3 additional parameter gather (across DP × CP)
-  let zeroVolume = 0;
-  if (zeroStage === 3 && dpForGradSync > 1) {
-    // AllGather params before each forward and backward pass
-    // Per layer: AllGather params = 2 * layer_params / DP * (DP-1)
-    // For all layers across all GA micro-batches
-    const layerParams = paramsPerRank / (model.numLayers / pipelineParallel);
-    const allGatherPerLayer = 2 * layerParams * bytes / dpForGradSync * (dpForGradSync - 1);
-    // Forward + Backward for each micro-batch
-    zeroVolume = 2 * allGatherPerLayer * (model.numLayers / pipelineParallel) * batch.gradientAccumulation;
-  }
-  
-  // Tensor Parallel communication (per layer, per micro-batch)
-  // Note: with CP, each GPU has seqLenPerGPU tokens
-  const activationSize = batch.microBatchSize * seqLenPerGPU * model.hiddenSize * bytes;
-  // 4 AllReduce per layer (2 forward: attn + ffn, 2 backward: attn + ffn)
-  const tpVolume = 4 * activationSize * (model.numLayers / pipelineParallel);
-  const tensorParallelVolume = tpVolume * batch.gradientAccumulation;
-  
-  // Pipeline Parallel communication
-  const ppVolume = 2 * activationSize * (pipelineParallel - 1); // P2P per micro-batch
-  const numMicrobatches = batch.gradientAccumulation * dataParallel;
-  const pipelineParallelVolume = ppVolume * numMicrobatches;
-  
-  // Expert Parallel communication (for MoE)
+
+  const tpCalls = tensorParallel > 1 ? 4 * layersPerStage * numMicrobatches : 0;
+  const tensorParallelVolume = activationTensorBytes * tpCalls;
+
+  const ppCalls = pipelineParallel > 1 ? 2 * numMicrobatches : 0;
+  const pipelineParallelVolume = activationTensorBytes * ppCalls;
+
   let expertParallelVolume = 0;
   if (model.ffnType === 'moe' && expertParallel > 1) {
     const topK = model.numExpertsPerToken || 2;
-    const moeLayerCount = model.numLayers / pipelineParallel;
-    // All-to-All: dispatch + combine
-    expertParallelVolume = 2 * batch.microBatchSize * seqLenPerGPU * 
-      model.hiddenSize * topK * bytes * moeLayerCount * batch.gradientAccumulation;
+    const moeLayersPerStage = numMoeLayers / pipelineParallel;
+    const expertMessageBytes =
+      batch.microBatchSize * seqLenPerGPU * model.hiddenSize * topK * activationElemBytes;
+    const expertCalls = 4 * moeLayersPerStage * numMicrobatches;
+    expertParallelVolume = expertMessageBytes * expertCalls;
   }
-  
-  // ============ Context Parallel Communication ============
-  // Reference: DeepSpeed Ulysses paper, Ring Attention papers
+
   let contextParallelVolume = 0;
+  let contextParallelTime = 0;
   if (contextParallel > 1) {
-    const layersPerStage = model.numLayers / pipelineParallel;
-    
     if (contextParallelType === 'ulysses') {
-      // Ulysses: All-to-all for Q, K, V before attention, then all-to-all for output
-      // Per layer: 4 all-to-all operations (Q, K, V input + output)
-      // Each all-to-all moves (N/CP) * d elements
-      // Total per layer: 4 * (N/CP) * d * bytes
-      // For forward + backward: 2x
-      const perLayerVolume = 4 * seqLenPerGPU * model.hiddenSize * bytes;
-      contextParallelVolume = 2 * perLayerVolume * layersPerStage * batch.gradientAccumulation;
+      const cpMessageBytes = activationTensorBytes;
+      const cpCalls = 8 * layersPerStage * numMicrobatches;
+      contextParallelVolume = cpMessageBytes * cpCalls;
     } else if (contextParallelType === 'ring') {
-      // Ring Attention: P2P ring communication of KV blocks
-      // Each GPU sends KV to next neighbor for CP-1 steps
-      // Per step: 2 * (N/CP) * d_kv * bytes (K + V)
-      // Total steps: CP - 1
-      // For forward + backward: 2x
-      const kvHeadDim = model.numKVHeads * model.headDim / tensorParallel;
-      const perStepVolume = 2 * seqLenPerGPU * kvHeadDim * bytes;
-      const numSteps = contextParallel - 1;
-      contextParallelVolume = 2 * perStepVolume * numSteps * layersPerStage * batch.gradientAccumulation;
-    } else if (contextParallelType === 'hybrid') {
-      // Hybrid: Ulysses within smaller groups, Ring across groups
-      // Calculate effective Ulysses degree (limited by KV heads)
+      const kvMessageBytes =
+        batch.microBatchSize * seqLenPerGPU
+        * ((model.numKVHeads * model.headDim * 2) / tensorParallel)
+        * activationElemBytes;
+      const cpCalls = 2 * (contextParallel - 1) * layersPerStage * numMicrobatches;
+      contextParallelVolume = kvMessageBytes * cpCalls;
+    } else {
       const effectiveKVHeads = model.numKVHeads / tensorParallel;
-      const ulyssesDegree = Math.min(contextParallel, effectiveKVHeads);
-      const ringDegree = contextParallel / ulyssesDegree;
-      
-      // Ulysses component
-      const ulyssesSeqLen = config.maxSeqLength / ulyssesDegree;
-      const ulyssesVolume = 4 * ulyssesSeqLen * model.hiddenSize * bytes;
-      
-      // Ring component
-      const ringSeqLen = ulyssesSeqLen / ringDegree;
-      const kvHeadDim = model.numKVHeads * model.headDim / tensorParallel / ulyssesDegree;
-      const ringPerStep = 2 * ringSeqLen * kvHeadDim * bytes;
-      const ringVolume = ringPerStep * (ringDegree - 1);
-      
-      contextParallelVolume = 2 * (ulyssesVolume + ringVolume) * layersPerStage * batch.gradientAccumulation;
+      const ulyssesDegree = Math.max(1, Math.min(contextParallel, effectiveKVHeads));
+      const ringDegree = Math.max(1, Math.ceil(contextParallel / ulyssesDegree));
+      const ulyssesMessageBytes =
+        batch.microBatchSize * Math.ceil(config.maxSeqLength / ulyssesDegree) * model.hiddenSize * activationElemBytes;
+      const ringMessageBytes =
+        batch.microBatchSize
+        * Math.ceil(config.maxSeqLength / contextParallel)
+        * ((model.numKVHeads * model.headDim * 2) / (tensorParallel * ulyssesDegree))
+        * activationElemBytes;
+      const ulyssesCalls = 8 * layersPerStage * numMicrobatches;
+      const ringCalls = 2 * Math.max(0, ringDegree - 1) * layersPerStage * numMicrobatches;
+
+      contextParallelVolume = ulyssesMessageBytes * ulyssesCalls + ringMessageBytes * ringCalls;
     }
   }
   
@@ -1068,11 +1399,17 @@ export function calculateCommunication(
   const commAssumptions = getAssumptions(config);
   
   // Helper to get bandwidth, latency, and hops based on whether comm crosses node boundary
-  const getCommParams = (parallelSize: number, dataBytes: number, numRanks: number) => {
+  const getCommParams = (
+    parallelSize: number,
+    tensorBytes: number,
+    numRanks: number,
+    numCalls: number = 1
+  ) => {
     const isIntraNode = parallelSize <= cluster.gpusPerNode;
     return {
-      dataBytes,
+      tensorBytes,
       numRanks,
+      numCalls,
       bandwidthGBs: isIntraNode ? intraNodeBW : interNodeBW,
       latencyUs: isIntraNode ? networkLatency.intraNodeLatencyUs : networkLatency.interNodeLatencyUs,
       numHops: isIntraNode ? networkLatency.intraNodeHops : networkLatency.interNodeHops,
@@ -1080,50 +1417,94 @@ export function calculateCommunication(
     };
   };
   
-  // DP gradient sync across DP × CP ranks (typically crosses nodes)
-  const dataParallelTime = dpForGradSync > 1 ? ringAllReduceTime(
-    getCommParams(dpForGradSync, dataParallelVolume, dpForGradSync)
-  ) : 0;
-  
-  // TP should be within node
-  const tensorParallelTime = ringAllReduceTime(
-    getCommParams(tensorParallel, tensorParallelVolume / batch.gradientAccumulation, tensorParallel)
-  ) * batch.gradientAccumulation;
-  
-  // PP communication
-  const pipelineParallelTime = p2pTime(
-    getCommParams(pipelineParallel, pipelineParallelVolume, pipelineParallel)
-  );
-  
-  // EP communication
-  let expertParallelTime = 0;
-  if (expertParallelVolume > 0) {
-    expertParallelTime = allToAllTime(
-      getCommParams(expertParallel, expertParallelVolume, expertParallel)
-    );
-  }
-  
-  // CP communication
-  // Ulysses benefits from NVLink (all-to-all is latency sensitive)
-  // Ring can work across nodes (P2P is bandwidth bound)
-  let contextParallelTime = 0;
-  if (contextParallel > 1) {
-    if (contextParallelType === 'ulysses') {
-      // All-to-all time
-      contextParallelTime = allToAllTime(
-        getCommParams(contextParallel, contextParallelVolume, contextParallel)
+  // Recompute collective times with per-call message sizes so latency scales with call count.
+  if (dpForGradSync > 1) {
+    if (zeroStage === 0 || zeroStage === 1) {
+      dataParallelTime = ringAllReduceTime(
+        getCommParams(dpForGradSync, localGradientTensorBytes, dpForGradSync, 1)
+      );
+    } else if (zeroStage === 2) {
+      dataParallelTime = reduceScatterTime(
+        getCommParams(dpForGradSync, localGradientTensorBytes, dpForGradSync, numMicrobatches)
+      );
+      zeroTime = allGatherTime(
+        getCommParams(dpForGradSync, localParameterTensorBytes, dpForGradSync, 1)
       );
     } else {
-      // Ring/Hybrid: P2P time
-      contextParallelTime = p2pTime(
-        getCommParams(contextParallel, contextParallelVolume, contextParallel)
+      const gradCalls = layersPerStage * numMicrobatches;
+      const paramCalls = 2 * layersPerStage * numMicrobatches;
+      dataParallelTime = reduceScatterTime(
+        getCommParams(dpForGradSync, perLayerGradientBytes, dpForGradSync, gradCalls)
+      );
+      zeroTime = allGatherTime(
+        getCommParams(dpForGradSync, perLayerParameterBytes, dpForGradSync, paramCalls)
       );
     }
   }
-  
-  // ZeRO-3 time (AllGather across DP × CP)
-  const zeroTime = zeroVolume > 0 ? 
-    allGatherTime(getCommParams(dpForGradSync, zeroVolume / 2, dpForGradSync)) * 2 : 0;
+
+  const tensorParallelTime = tensorParallel > 1
+    ? ringAllReduceTime(
+        getCommParams(tensorParallel, activationTensorBytes, tensorParallel, tpCalls)
+      )
+    : 0;
+
+  const pipelineParallelTime = pipelineParallel > 1
+    ? p2pTime(
+        getCommParams(pipelineParallel, activationTensorBytes, 2, ppCalls)
+      )
+    : 0;
+
+  let expertParallelTime = 0;
+  if (expertParallelVolume > 0) {
+    const topK = model.numExpertsPerToken || 2;
+    const moeLayersPerStage = numMoeLayers / pipelineParallel;
+    const expertMessageBytes =
+      batch.microBatchSize * seqLenPerGPU * model.hiddenSize * topK * activationElemBytes;
+    const expertCalls = 4 * moeLayersPerStage * numMicrobatches;
+    expertParallelTime = allToAllTime(
+      getCommParams(expertParallel, expertMessageBytes, expertParallel, expertCalls)
+    );
+  }
+
+  if (contextParallel > 1) {
+    if (contextParallelType === 'ulysses') {
+      const cpMessageBytes = activationTensorBytes;
+      const cpCalls = 8 * layersPerStage * numMicrobatches;
+      contextParallelTime = allToAllTime(
+        getCommParams(contextParallel, cpMessageBytes, contextParallel, cpCalls)
+      );
+    } else if (contextParallelType === 'ring') {
+      const kvMessageBytes =
+        batch.microBatchSize * seqLenPerGPU
+        * ((model.numKVHeads * model.headDim * 2) / tensorParallel)
+        * activationElemBytes;
+      const cpCalls = 2 * (contextParallel - 1) * layersPerStage * numMicrobatches;
+      contextParallelTime = p2pTime(
+        getCommParams(contextParallel, kvMessageBytes, 2, cpCalls)
+      );
+    } else {
+      const effectiveKVHeads = model.numKVHeads / tensorParallel;
+      const ulyssesDegree = Math.max(1, Math.min(contextParallel, effectiveKVHeads));
+      const ringDegree = Math.max(1, Math.ceil(contextParallel / ulyssesDegree));
+      const ulyssesMessageBytes =
+        batch.microBatchSize * Math.ceil(config.maxSeqLength / ulyssesDegree) * model.hiddenSize * activationElemBytes;
+      const ringMessageBytes =
+        batch.microBatchSize
+        * Math.ceil(config.maxSeqLength / contextParallel)
+        * ((model.numKVHeads * model.headDim * 2) / (tensorParallel * ulyssesDegree))
+        * activationElemBytes;
+      const ulyssesCalls = 8 * layersPerStage * numMicrobatches;
+      const ringCalls = 2 * Math.max(0, ringDegree - 1) * layersPerStage * numMicrobatches;
+
+      contextParallelTime =
+        allToAllTime(
+          getCommParams(ulyssesDegree, ulyssesMessageBytes, ulyssesDegree, ulyssesCalls)
+        )
+        + p2pTime(
+          getCommParams(ringDegree, ringMessageBytes, 2, ringCalls)
+        );
+    }
+  }
   
   const totalTime = dataParallelTime + tensorParallelTime + 
     pipelineParallelTime + expertParallelTime + contextParallelTime + zeroTime;
@@ -1162,20 +1543,20 @@ export function analyzeTrainingStep(
   config: TrainingConfig,
   cluster: ClusterTopology
 ): TrainingStepAnalysis {
-  const params = calculateModelParameters(model);
-  const { tensorParallel, pipelineParallel, dataParallel, contextParallel } = config.parallelism;
+  const { tensorParallel, pipelineParallel, contextParallel } = config.parallelism;
   
-  // Compute FLOPs per micro-batch (total model FLOPs, before parallelism splitting)
-  // Citation: "Training Compute-Optimal Large Language Models" (Hoffmann et al., 2022)
-  // Forward: ~2N FLOPs per token, Backward: ~4N FLOPs per token
-  const tokens = config.batch.microBatchSize * config.maxSeqLength;
-  const forwardFlops = 2 * params.total * tokens; // ~2N per token
-  const backwardFlops = 2 * forwardFlops; // Backward is ~2x forward
-  const totalFlops = forwardFlops + backwardFlops; // 6N per token
+  // Compute FLOPs per micro-batch using a Megatron-style Transformer/MoE estimator.
+  // This keeps routed MoE compute proportional to active experts (top-k), not total experts.
+  const totalFlops = estimateTrainingFlops(
+    model,
+    config.batch.microBatchSize,
+    config.maxSeqLength
+  );
+  const forwardFlops = totalFlops / 3;
+  const backwardFlops = totalFlops - forwardFlops;
   
-  // With TP/PP, each GPU only computes a fraction of the model
-  // TP splits each layer across GPUs, PP splits layers across stages
-  const modelParallelDegree = tensorParallel * pipelineParallel;
+  // With TP/PP/CP, each GPU only computes a fraction of the model.
+  const modelParallelDegree = tensorParallel * pipelineParallel * contextParallel;
   const forwardFlopsPerGPU = forwardFlops / modelParallelDegree;
   const backwardFlopsPerGPU = backwardFlops / modelParallelDegree;
   
@@ -1191,33 +1572,16 @@ export function analyzeTrainingStep(
     recomputationMultiplier = 1 + stepAssumptions.recomputationBlockOverhead; // ~15% overhead
   }
   
-  // Compute time per micro-batch per GPU using Roofline Model
-  // The actual time is max(compute-bound time, memory-bound time)
-  // 
-  // For training, memory access per forward pass:
-  // - Read weights: P/(TP*PP) bytes
-  // - Read activations: B * S * H * L bytes (per layer)
-  // - Write activations: B * S * H * L bytes (per layer)
-  // For backward, memory access is roughly 2x forward
-  const effectiveCompute = cluster.gpuComputeTFLOPS * 1e12; // FLOPS
-  const effectiveBandwidth = cluster.gpuMemoryBandwidthTBs * 1e12; // bytes/s
-  
-  // Params per GPU after TP/PP
-  const paramsPerGPU = params.total / modelParallelDegree;
-  const paramBytes = paramsPerGPU * getPrecisionBytes(config.mixedPrecision);
-  
-  // Activations memory access per micro-batch (rough estimate)
-  // Each layer: read input (B*S*H), compute, write output (B*S*H)
-  // With CP, sequence length per GPU is S/CP
-  const seqLenPerGPU = config.maxSeqLength / contextParallel;
-  const activationBytesPerLayer = 2 * config.batch.microBatchSize * seqLenPerGPU * 
-    model.hiddenSize * getPrecisionBytes(config.mixedPrecision);
-  const layersPerGPU = model.numLayers / pipelineParallel;
-  
-  // Forward memory access: read weights once + read/write activations per layer
-  const forwardMemoryBytes = paramBytes + activationBytesPerLayer * layersPerGPU;
-  // Backward memory access: ~2x forward (read gradients, write gradients, read weights, read activations)
-  const backwardMemoryBytes = forwardMemoryBytes * 2;
+  // Compute time per micro-batch per GPU using a roofline-style model with
+  // explicit training HBM traffic estimates instead of a single 6N approximation.
+  const effectiveCompute =
+    cluster.gpuComputeTFLOPS * 1e12 * stepAssumptions.kernelEfficiency;
+  const effectiveBandwidth =
+    cluster.gpuMemoryBandwidthTBs * 1e12 * stepAssumptions.memoryBandwidthEfficiency;
+
+  const memoryTraffic = estimateTrainingMemoryTraffic(model, config);
+  const forwardMemoryBytes = memoryTraffic.forwardBytes;
+  const backwardMemoryBytes = memoryTraffic.backwardBytes;
   
   // Compute-bound time (FLOPs / peak compute)
   const forwardComputeTime = forwardFlopsPerGPU / effectiveCompute * 1000; // ms
@@ -1275,23 +1639,23 @@ export function analyzeTrainingStep(
   // MFU (Model FLOPs Utilization) = Useful FLOPs / Peak FLOPs
   // Citation: "PaLM: Scaling Language Modeling with Pathways" (Chowdhery et al., 2022)
   // 
-  // Useful FLOPs per step = 6 * N * globalBatch * S
-  // Where: N = total params, globalBatch = microBatch * DP * gradAccum, S = seqLen
-  // Note: DP ranks each process different data, so total useful FLOPs = 6N * globalBatch * S
+  // Useful FLOPs per step are estimated directly from the current training batch,
+  // so MoE uses active-expert compute rather than total-expert params.
   // 
   // Peak FLOPs = totalGPUs * gpuPeakFLOPS * timePerStep
-  const effectiveDP = dataParallel * contextParallel; // CP is part of DP dimension
   const theoreticalPeakFlops = cluster.gpuComputeTFLOPS * 1e12 * 
     (timePerStep / 1000) * config.parallelism.totalGPUs;
   
   // MFU = Useful work / Peak capacity
-  // For training: useful work = 6 * N * globalBatch * S per step
-  const globalBatchSize = config.batch.microBatchSize * effectiveDP * config.batch.gradientAccumulation;
-  const totalUsefulFlops = 6 * params.total * globalBatchSize * config.maxSeqLength;
+  const totalUsefulFlops = estimateTrainingFlops(
+    model,
+    config.batch.globalBatchSize,
+    config.maxSeqLength
+  );
   const mfu = totalUsefulFlops / theoreticalPeakFlops;
   
   // HFU includes recomputation overhead in "useful" work
-  const hfu = mfu * recomputationMultiplier;
+  const hfu = (totalUsefulFlops * recomputationMultiplier) / theoreticalPeakFlops;
   
   const computeEfficiency = totalComputeTime / timePerStep;
   const memoryEfficiency = memoryBreakdown.totalPerGPU / (cluster.gpuMemoryGB * 1e9);
@@ -1317,6 +1681,81 @@ export function analyzeTrainingStep(
     tokensPerSecond,
     samplesPerSecond,
     timePerStep,
+  };
+}
+
+export interface TrainingTimeEstimate {
+  totalTokens: number;
+  tokensPerStep: number;
+  totalSteps: number;
+  tokensPerSecond: number;
+  samplesPerSecond: number;
+  timeSeconds: number;
+  gpuHours: number;
+  gpuDays: number;
+  activeGPUs: number;
+}
+
+/**
+ * Estimate end-to-end pretraining time from a target MFU and token budget.
+ *
+ * Assumptions:
+ * - Pretraining FLOPs/token come from the explicit Transformer/MoE estimator
+ * - Sequence length is fixed for the run, so steps = total_tokens / (GBS * seq_len)
+ */
+export function estimateTrainingTime(
+  model: ModelConfig,
+  config: TrainingConfig,
+  cluster: ClusterTopology,
+  targetMfu: number,
+  totalTokens: number
+): TrainingTimeEstimate | null {
+  const activeGPUs = config.parallelism.totalGPUs;
+  const tokensPerStep = config.batch.globalBatchSize * config.maxSeqLength;
+
+  if (!Number.isFinite(targetMfu) || targetMfu <= 0 || targetMfu > 1) {
+    return null;
+  }
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(activeGPUs) || activeGPUs <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(tokensPerStep) || tokensPerStep <= 0) {
+    return null;
+  }
+
+  const flopsPerToken = estimateTrainingFlopsPerToken(model, config.maxSeqLength);
+  if (!Number.isFinite(flopsPerToken) || flopsPerToken <= 0) {
+    return null;
+  }
+
+  const totalTrainFlops = flopsPerToken * totalTokens;
+  const effectiveSystemFlopsPerSecond =
+    cluster.gpuComputeTFLOPS * 1e12 * activeGPUs * targetMfu;
+
+  if (!Number.isFinite(effectiveSystemFlopsPerSecond) || effectiveSystemFlopsPerSecond <= 0) {
+    return null;
+  }
+
+  const timeSeconds = totalTrainFlops / effectiveSystemFlopsPerSecond;
+  const tokensPerSecond = totalTokens / timeSeconds;
+  const samplesPerSecond = tokensPerSecond / config.maxSeqLength;
+  const totalSteps = totalTokens / tokensPerStep;
+  const gpuHours = (timeSeconds * activeGPUs) / 3600;
+  const gpuDays = gpuHours / 24;
+
+  return {
+    totalTokens,
+    tokensPerStep,
+    totalSteps,
+    tokensPerSecond,
+    samplesPerSecond,
+    timeSeconds,
+    gpuHours,
+    gpuDays,
+    activeGPUs,
   };
 }
 
